@@ -23,18 +23,19 @@ fi
 SPEC_FILE="$(realpath "$SPEC_FILE")"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 
-# Ensure conversations directory exists
-CONVERSATIONS_DIR="${REPO_ROOT}/conversations"
-mkdir -p "${CONVERSATIONS_DIR}"
+# Ensure spec-to-pr data directory exists on host (outside repo)
+SPEC_TO_PR_DATA="${HOME}/.spec-to-pr"
+mkdir -p "${SPEC_TO_PR_DATA}/sessions"
+mkdir -p "${SPEC_TO_PR_DATA}/conversations"
 
 echo "Running spec-to-pr for: $SPEC_FILE"
 echo "Repository root: $REPO_ROOT"
-echo "Conversations: $CONVERSATIONS_DIR"
+echo "Data directory: $SPEC_TO_PR_DATA"
 echo ""
 
 podman run --rm \
   -v "${REPO_ROOT}":/workspace:z \
-  -v "${CONVERSATIONS_DIR}":/conversations:z \
+  -v "${SPEC_TO_PR_DATA}":/spec-to-pr-data:z \
   -v ~/.aws/credentials:/root/.aws/credentials:ro,z \
   -e "GITHUB_TOKEN=${GITHUB_TOKEN}" \
   -e "AWS_PROFILE=${AWS_PROFILE:-rrp-central}" \

@@ -189,70 +189,106 @@ class Orchestrator:
 
     def _submit_prs(self, session: OrchestratorSession) -> None:
         log.info("Submitting PRs for %d repos", len(session.repos))
-        for repo in session.repos:
-            if repo.status in ("committed",) and repo.pr_url is None:
-                pr_url = self._create_pr(repo.repo_name, repo.branch, session)
-                if pr_url:
-                    repo.pr_url = pr_url
+
+        # Build list of repos that need PR creation
+        repos_to_process = [
+            repo for repo in session.repos
+            if repo.status in ("committed",) and repo.pr_url is None
+        ]
+
+        if not repos_to_process:
+            log.info("No repos need PR creation")
+            self.state_machine.transition(session, prs_created=True)
+            return
+
+        # Use pr-submitter agent to push and create PRs
+        try:
+            self._run_pr_submission_agent(repos_to_process, session)
+            # Mark all as pr_created (agent should have handled them)
+            for repo in repos_to_process:
+                if repo.pr_url:
                     repo.status = "pr_created"
-        self.state_machine.transition(session, prs_created=True)
+            self.state_machine.transition(session, prs_created=True)
+        except Exception as exc:
+            log.error("PR submission failed: %s", exc)
+            self.state_machine.transition(session, prs_created=False)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
     def _commit_and_track_changes(self, session: OrchestratorSession) -> None:
-        """Detect git changes, create branch, commit, and track in session.repos."""
+        """Use committer agent to intelligently stage and commit changes."""
         from spec_to_pr.models.session import RepoState
 
-        # Check for changes
-        result = subprocess.run(
-            ["git", "status", "--porcelain"],
-            capture_output=True,
-            text=True,
-            cwd=self.config.workspace,
-        )
-
-        if result.returncode != 0 or not result.stdout.strip():
-            log.info("No git changes detected, skipping commit")
-            return
-
-        changed_files = [line.split()[-1] for line in result.stdout.strip().split('\n')]
-        log.info("Detected %d changed files: %s", len(changed_files), changed_files[:5])
-
-        # Get current repo info
-        repo_url = subprocess.run(
+        # Get current repo info first
+        repo_url_result = subprocess.run(
             ["git", "remote", "get-url", "origin"],
             capture_output=True,
             text=True,
             cwd=self.config.workspace,
-        ).stdout.strip()
+        )
+        if repo_url_result.returncode != 0:
+            log.error("Failed to get origin URL, skipping commit")
+            return
 
-        # Extract repo name from URL (e.g., org/repo)
+        repo_url = repo_url_result.stdout.strip()
         repo_name = repo_url.replace("https://github.com/", "").replace(".git", "")
-
-        # Create branch
         branch_name = f"spec-to-pr/{session.work_item.work_id}"
-        subprocess.run(
-            ["git", "checkout", "-b", branch_name],
-            capture_output=True,
-            cwd=self.config.workspace,
-        )
-        log.info("Created branch: %s", branch_name)
 
-        # Stage and commit changes
-        subprocess.run(
-            ["git", "add"] + changed_files,
-            cwd=self.config.workspace,
+        # Use committer agent to handle filtering and committing
+        runner, system_prompt = self._make_runner("committer")
+
+        task = (
+            f"Work ID: {session.work_item.work_id}\n"
+            f"Branch: {branch_name}\n\n"
+            f"You need to commit the changes for this work item.\n\n"
+            f"1. Check `git status` to see what files have changed\n"
+            f"2. Filter out spec-to-pr metadata:\n"
+            f"   - .spec-to-pr/ directory\n"
+            f"   - conversations/ directory\n"
+            f"   - Spec files (*.md files that match the work ID or are in the workspace root)\n"
+            f"3. Create branch '{branch_name}' (use `git checkout -b` if it doesn't exist)\n"
+            f"4. Stage ONLY the filtered implementation files (use `git add <file1> <file2>...`)\n"
+            f"5. Commit with this message format:\n"
+            f"   [{session.work_item.work_id}] <brief description of changes>\n\n"
+            f"   Spec-to-pr automated changes for work item {session.work_item.work_id}\n\n"
+            f"   Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>\n\n"
+            f"After committing, report the committed files in this format:\n"
+            f"Committed files: <file1>, <file2>, <file3>\n\n"
+            f"When done, respond with 'Commit complete.'"
         )
 
-        commit_msg = f"[{session.work_item.work_id}] Automated implementation\n\nSpec-to-pr automated changes for work item {session.work_item.work_id}"
-        subprocess.run(
-            ["git", "commit", "-m", commit_msg],
-            capture_output=True,
-            cwd=self.config.workspace,
+        result = runner.run(
+            system_prompt=system_prompt,
+            task=task,
+            work_id=f"{session.work_item.work_id}-commit"
         )
-        log.info("Committed changes: %s", commit_msg.split('\n')[0])
+        log.info("Committer agent finished. Summary: %s", result[:300])
+
+        # Parse committed files from agent output
+        import re
+        committed_files_match = re.search(r'Committed files:\s*(.+?)(?:\n|$)', result)
+        committed_files = []
+        if committed_files_match:
+            files_str = committed_files_match.group(1)
+            committed_files = [f.strip() for f in files_str.split(',') if f.strip()]
+            log.info("Parsed %d committed files from agent output", len(committed_files))
+        else:
+            log.warning("Could not parse committed files from agent output, using git diff")
+            # Fallback: check what was actually committed
+            diff_result = subprocess.run(
+                ["git", "diff", "--name-only", "HEAD~1", "HEAD"],
+                capture_output=True,
+                text=True,
+                cwd=self.config.workspace,
+            )
+            if diff_result.returncode == 0:
+                committed_files = [f.strip() for f in diff_result.stdout.strip().split('\n') if f.strip()]
+
+        if not committed_files:
+            log.warning("No committed files detected, skipping repo tracking")
+            return
 
         # Track in session
         repo_state = RepoState(
@@ -260,11 +296,12 @@ class Orchestrator:
             repo_url=repo_url,
             workspace_path=str(self.config.workspace),
             branch=branch_name,
-            changes=changed_files,
+            changes=committed_files,
             status="committed",
         )
         session.repos.append(repo_state)
-        log.info("Tracked repo state: %s on branch %s", repo_name, branch_name)
+        log.info("Tracked repo state: %s on branch %s with %d files",
+                 repo_name, branch_name, len(committed_files))
 
     def _load_project_docs(self) -> None:
         """Load project documentation (CLAUDE.md) to provide environment context."""
@@ -436,73 +473,55 @@ Keep the reason brief (one sentence)."""
             if line.strip() and not line.strip().startswith("#")
         ]
 
-    def _create_pr(self, repo_name: str, branch: str, session: OrchestratorSession) -> Optional[str]:
-        # Detect the fork remote to push to (not upstream origin)
-        remote_result = subprocess.run(
-            ["git", "remote", "-v"],
-            capture_output=True,
-            text=True,
-            cwd=self.config.workspace,
+    def _run_pr_submission_agent(self, repos: list, session: OrchestratorSession) -> None:
+        """Run PR submission agent to push branches and create PRs."""
+        runner, system_prompt = self._make_runner("pr-submitter")
+
+        # Build task description with repo info
+        repos_info = []
+        for repo in repos:
+            repos_info.append(
+                f"- Repository: {repo.repo_name}\n"
+                f"  Branch: {repo.branch}\n"
+                f"  Workspace: {repo.workspace_path}\n"
+                f"  Changed files: {len(repo.changes)}"
+            )
+
+        task = (
+            f"Work ID: {session.work_item.work_id}\n"
+            f"Attempt: {session.attempt_number}\n\n"
+            f"You need to push branches and create pull requests for the following repositories:\n\n"
+            f"{chr(10).join(repos_info)}\n\n"
+            f"For each repository:\n"
+            f"1. Inspect `git remote -v` to identify fork and upstream remotes\n"
+            f"2. Push the branch to the fork remote (or origin if no fork exists)\n"
+            f"3. Create a PR against the upstream repository using `gh pr create`\n\n"
+            f"PR details:\n"
+            f"- Title: [{session.work_item.work_id}] Automated implementation\n"
+            f"- Body: Include work ID, attempt number ({session.attempt_number}), and 'Generated by spec-to-pr'\n\n"
+            f"After creating each PR, report the PR URL in the format:\n"
+            f"PR created for <repo-name>: <url>\n\n"
+            f"When all PRs are created, respond with 'PR submission complete.'"
         )
 
-        # Parse remotes and look for a fork
-        remotes = {}
-        for line in remote_result.stdout.split('\n'):
-            parts = line.split()
-            if len(parts) >= 2:
-                remote_name = parts[0]
-                remote_url = parts[1]
-                if '(push)' in line:  # Only care about push URLs
-                    remotes[remote_name] = remote_url
-
-        # Strategy: prefer any remote that isn't 'origin', or has 'bot'/'fork' in name
-        remote_to_use = None
-        for remote_name, remote_url in remotes.items():
-            if remote_name != 'origin':
-                remote_to_use = remote_name
-                break
-            if 'bot' in remote_name.lower() or 'fork' in remote_name.lower():
-                remote_to_use = remote_name
-                break
-
-        if not remote_to_use:
-            remote_to_use = 'origin'  # Fallback
-
-        # Push branch to fork
-        log.info("Pushing branch %s to %s (%s)", branch, remote_to_use, remotes.get(remote_to_use, 'unknown'))
-        push_result = subprocess.run(
-            ["git", "push", "-u", remote_to_use, branch],
-            capture_output=True,
-            text=True,
-            cwd=self.config.workspace,
+        result = runner.run(
+            system_prompt=system_prompt,
+            task=task,
+            work_id=f"{session.work_item.work_id}-pr"
         )
-        if push_result.returncode != 0:
-            log.error("git push to %s failed: %s", remote_to_use, push_result.stderr)
-            return None
+        log.info("PR submission agent finished. Summary: %s", result[:300])
 
-        # Create PR
-        log.info("Creating PR for %s on branch %s", repo_name, branch)
-        result = subprocess.run(
-            [
-                "gh", "pr", "create",
-                "--title", f"[{session.work_item.work_id}] Automated implementation",
-                "--body", (
-                    f"Automated PR for {session.work_item.work_id}\n\n"
-                    f"Attempt: {session.attempt_number}\n\n"
-                    f"Generated by spec-to-pr"
-                ),
-                "--head", branch,
-            ],
-            capture_output=True,
-            text=True,
-            cwd=self.config.workspace,
-        )
-        if result.returncode == 0:
-            pr_url = result.stdout.strip()
-            log.info("Created PR: %s", pr_url)
-            return pr_url
-        log.error("gh pr create failed for %s: %s", repo_name, result.stderr)
-        return None
+        # Parse PR URLs from agent output
+        import re
+        pr_url_pattern = r'PR created for ([^:]+):\s*(https://[^\s]+)'
+        for match in re.finditer(pr_url_pattern, result):
+            repo_match, pr_url = match.groups()
+            # Find the repo and update its pr_url
+            for repo in repos:
+                if repo_match.strip() in repo.repo_name:
+                    repo.pr_url = pr_url.strip()
+                    log.info("Recorded PR URL for %s: %s", repo.repo_name, repo.pr_url)
+                    break
 
     def _estimate_progress(self, session: OrchestratorSession) -> float:
         return max(0.0, 1.0 - (session.attempt_number / session.max_attempts))
