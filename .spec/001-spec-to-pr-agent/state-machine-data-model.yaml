@@ -1,0 +1,302 @@
+state_machine:
+  initial_state: spec_ingestion
+
+  phases:
+    spec_ingestion:
+      description: Parse and validate the input feature specification
+      transitions:
+        - to: implementation
+          condition: spec_parsed_and_validated
+        - to: dry_run_review
+          condition: dry_run_mode_enabled
+
+    dry_run_review:
+      description: Present implementation plan for human review without executing
+      transitions:
+        - to: implementation
+          condition: human_approved
+        - to: aborted
+          condition: human_rejected
+
+    implementation:
+      description: Implement feature code and E2E tests across repos
+      sub_phases:
+        - implement_e2e
+        - implement_feature
+        - refine_e2e
+      transitions:
+        - to: deployment
+          condition: implementation_complete
+        - to: circuit_breaker_check
+          condition: implementation_failed
+
+    deployment:
+      description: Deploy changes to ephemeral environment
+      actions:
+        - make ephemeral-dev
+        - make resync
+      transitions:
+        - to: e2e_execution
+          condition: deployment_successful
+        - to: debug
+          condition: deployment_failed
+
+    e2e_execution:
+      description: Run E2E tests against deployed environment
+      transitions:
+        - to: pr_submission
+          condition: all_tests_passed
+        - to: debug
+          condition: tests_failed
+
+    debug:
+      description: Analyze failures using cluster observability
+      data_sources:
+        - metrics
+        - logs
+        - kubernetes_apis
+        - argocd_state
+      transitions:
+        - to: circuit_breaker_check
+          condition: debug_analysis_complete
+
+    circuit_breaker_check:
+      description: Evaluate whether to retry or escalate
+      transitions:
+        - to: implementation
+          condition: retry_allowed
+        - to: human_escalation
+          condition: breaker_tripped
+
+    pr_submission:
+      description: Create PRs across affected repositories
+      transitions:
+        - to: complete
+          condition: prs_created
+
+    human_escalation:
+      description: Notify human with full debug context
+      terminal: true
+
+    complete:
+      description: All PRs submitted for review
+      terminal: true
+
+    aborted:
+      description: Workflow aborted by human during dry run
+      terminal: true
+
+data_models:
+  work_item:
+    description: >
+      The unit of work driving the agent. Can originate from a JIRA ticket,
+      a local spec file, or inline text. Every work item has a work_id that
+      serves as the universal key for memory, debug sessions, and file storage.
+    fields:
+      work_id:
+        type: string
+        description: >
+          Universal identifier for this work item. For JIRA sources this is
+          the JIRA ID (e.g., ROSAENG-1234). For file or inline sources, a
+          JIRA-style ID is generated or extracted from the file
+          (e.g., SPEC-0001). Used as the key for all memory and state.
+      source_type:
+        type: string
+        enum: [jira, file, inline]
+      source_ref:
+        type: string
+        description: >
+          JIRA ID, file path, or "inline" depending on source_type.
+          For file sources, the file may contain a work_id field in its
+          frontmatter — if present, that value is used as work_id.
+      spec_content:
+        type: string
+        description: The parsed specification text
+
+  orchestrator_session:
+    description: Top-level state for an orchestrator run
+    fields:
+      session_id:
+        type: string
+        format: uuid
+      work_item:
+        $ref: "#/data_models/work_item"
+      current_phase:
+        type: string
+        enum:
+          - spec_ingestion
+          - dry_run_review
+          - implementation
+          - deployment
+          - e2e_execution
+          - debug
+          - circuit_breaker_check
+          - pr_submission
+          - human_escalation
+          - complete
+          - aborted
+      attempt_number:
+        type: integer
+        default: 0
+      max_attempts:
+        type: integer
+        default: 3
+      dry_run:
+        type: boolean
+        default: false
+      repos:
+        type: array
+        items:
+          $ref: "#/data_models/repo_state"
+      created_at:
+        type: string
+        format: datetime
+      updated_at:
+        type: string
+        format: datetime
+
+  repo_state:
+    description: Tracks changes in a single repository
+    fields:
+      repo_name:
+        type: string
+      repo_url:
+        type: string
+      branch:
+        type: string
+      workspace_path:
+        type: string
+        description: Absolute path within container workspace
+      changes:
+        type: array
+        items:
+          type: string
+          description: List of modified files
+      pr_url:
+        type: string
+        nullable: true
+      status:
+        type: string
+        enum: [clean, modified, committed, pr_created]
+
+  debug_memory_entry:
+    description: A single debug attempt record, keyed by work_id
+    fields:
+      attempt_number:
+        type: integer
+      timestamp:
+        type: string
+        format: datetime
+      phase_at_failure:
+        type: string
+        enum: [implementation, deployment, e2e_execution]
+      error_summary:
+        type: string
+        description: One-line description of the failure
+      error_fingerprint:
+        type: string
+        description: Hash of error signature for dedup detection
+      test_results:
+        type: object
+        properties:
+          total:
+            type: integer
+          passed:
+            type: integer
+          failed:
+            type: integer
+          failed_tests:
+            type: array
+            items:
+              type: string
+      debug_findings:
+        type: array
+        items:
+          type: string
+          description: Observations from logs, metrics, k8s state
+      hypotheses:
+        type: array
+        items:
+          type: string
+          description: Theories about root cause
+      changes_attempted:
+        type: array
+        items:
+          type: string
+          description: Files modified in this attempt
+      outcome:
+        type: string
+        enum: [retry, escalated]
+
+  circuit_breaker_state:
+    description: Tracks retry attempts and heuristic signals
+    fields:
+      attempt_count:
+        type: integer
+        default: 0
+      max_attempts:
+        type: integer
+        default: 3
+      error_fingerprints:
+        type: array
+        items:
+          type: string
+        description: Ordered list of error fingerprints per attempt
+      progress_scores:
+        type: array
+        items:
+          type: number
+        description: Metric per attempt (e.g., ratio of tests passing)
+      tripped:
+        type: boolean
+        default: false
+      trip_reason:
+        type: string
+        nullable: true
+        enum: [max_attempts_reached, repeated_error, no_progress]
+
+  phase_context:
+    description: Contract for data passed between Claude SDK sessions at phase boundaries
+    fields:
+      from_phase:
+        type: string
+      to_phase:
+        type: string
+      session_state:
+        $ref: "#/data_models/orchestrator_session"
+      previous_attempts:
+        type: array
+        items:
+          $ref: "#/data_models/debug_memory_entry"
+      implementation_plan:
+        type: string
+        nullable: true
+        description: Markdown plan produced during spec_ingestion
+      ephemeral_env:
+        type: object
+        nullable: true
+        properties:
+          env_id:
+            type: string
+          region:
+            type: string
+          api_url:
+            type: string
+          state:
+            type: string
+            enum: [provisioning, ready, failed, teardown]
+
+file_storage:
+  description: Workspace-based file storage layout, keyed by work_id
+  base_path: .spec-to-pr/sessions/
+  structure:
+    - "{work_id}/session.yaml"
+    - "{work_id}/attempts/{attempt_number}.yaml"
+    - "{work_id}/circuit-breaker.yaml"
+    - "{work_id}/phase-context.yaml"
+  migration_notes: |
+    File storage is the initial implementation. Each file uses the YAML
+    schemas defined above. Future migration to a database should:
+    1. Preserve the same data model structure
+    2. Add an adapter layer (file vs. db backend)
+    3. Support querying by work_id, attempt_number, and error_fingerprint
