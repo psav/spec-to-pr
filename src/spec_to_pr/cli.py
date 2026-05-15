@@ -29,9 +29,9 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--dry-run", action="store_true", help="Plan only — do not deploy or test")
     run_p.add_argument("--skip-deploy", action="store_true", help="Skip ephemeral deploy/e2e — go straight to PR after implementation")
     run_p.add_argument("--max-attempts", type=int, default=3, metavar="N")
-    run_p.add_argument("--storage", default=".spec-to-pr/sessions", metavar="PATH")
-    run_p.add_argument("--agents", default=".claude/agents", metavar="PATH")
-    run_p.add_argument("--conversations", default="/conversations", metavar="PATH")
+    run_p.add_argument("--storage", default="/spec-to-pr-data/sessions", metavar="PATH")
+    run_p.add_argument("--agents", default="/opt/spec-to-pr/.claude/agents", metavar="PATH")
+    run_p.add_argument("--conversations", default="/spec-to-pr-data/conversations", metavar="PATH")
     run_p.add_argument("--project-docs", metavar="PATH", help="Path to CLAUDE.md or project docs (auto-discovers if not specified)")
 
     # ---- status ----
@@ -43,8 +43,8 @@ def _build_parser() -> argparse.ArgumentParser:
     resume_p = sub.add_parser("resume", help="Resume an interrupted session")
     resume_p.add_argument("--work-id", required=True, metavar="ID")
     resume_p.add_argument("--storage", default=".spec-to-pr/sessions", metavar="PATH")
-    resume_p.add_argument("--agents", default=".claude/agents", metavar="PATH")
-    resume_p.add_argument("--conversations", default="/conversations", metavar="PATH")
+    resume_p.add_argument("--agents", default="/opt/spec-to-pr/.claude/agents", metavar="PATH")
+    resume_p.add_argument("--conversations", default="/tmp/.spec-to-pr/conversations", metavar="PATH")
     resume_p.add_argument("--project-docs", metavar="PATH", help="Path to CLAUDE.md or project docs (auto-discovers if not specified)")
     resume_p.add_argument("--max-attempts", type=int, default=3, metavar="N")
 
