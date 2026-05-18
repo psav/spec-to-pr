@@ -55,6 +55,7 @@ class Orchestrator:
         session = OrchestratorSession.new(work_item, dry_run=dry_run, max_attempts=self.config.max_attempts)
         self._circuit_breaker = CircuitBreaker(max_attempts=self.config.max_attempts)
         self.storage.save_session(session)
+        self._context_log_init(session)
         return self._run_loop(session)
 
     def resume(self, work_id: str) -> OrchestratorSession:
@@ -148,12 +149,29 @@ class Orchestrator:
 
     def _deploy(self, session: OrchestratorSession) -> None:
         log.info("Deploying to ephemeral environment")
-        ok = self._run_make("ephemeral-provision")
+        cwd = Path(session.repos[0].workspace_path) if session.repos else self.config.workspace
+        log.info("Running make ephemeral-provision in %s", cwd)
+        ok = self._run_make("ephemeral-provision", cwd=cwd)
+        if not ok:
+            self._context_log_append(
+                session,
+                f"Deployment FAILED — attempt {session.attempt_number}",
+                f"- `make ephemeral-provision` failed in `{cwd}`\n"
+                f"- Entering debug phase",
+            )
         self.state_machine.transition(session, deployment_successful=ok)
 
     def _run_e2e(self, session: OrchestratorSession) -> None:
         log.info("Running e2e tests")
-        ok = self._run_make("ephemeral-e2e")
+        cwd = Path(session.repos[0].workspace_path) if session.repos else self.config.workspace
+        ok = self._run_make("ephemeral-e2e", cwd=cwd)
+        if not ok:
+            self._context_log_append(
+                session,
+                f"E2E FAILED — attempt {session.attempt_number}",
+                f"- `make ephemeral-e2e` failed in `{cwd}`\n"
+                f"- Entering debug phase",
+            )
         self.state_machine.transition(session, tests_passed=ok)
 
     def _debug(self, session: OrchestratorSession) -> None:
@@ -218,90 +236,159 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def _commit_and_track_changes(self, session: OrchestratorSession) -> None:
-        """Use committer agent to intelligently stage and commit changes."""
+        """Discover repos with local work under the workspace, commit, and track them.
+
+        Scans all direct subdirectories of the workspace for git repos that have
+        either uncommitted changes or local commits not yet pushed to any remote.
+        Runs the committer agent once per repo found. Works naturally for multi-repo
+        specs where the developer clones several repos side-by-side.
+        """
         from spec_to_pr.models.session import RepoState
+        import re
 
-        # Get current repo info first
-        repo_url_result = subprocess.run(
-            ["git", "remote", "get-url", "origin"],
-            capture_output=True,
-            text=True,
-            cwd=self.config.workspace,
-        )
-        if repo_url_result.returncode != 0:
-            log.error("Failed to get origin URL, skipping commit")
-            return
-
-        repo_url = repo_url_result.stdout.strip()
-        repo_name = repo_url.replace("https://github.com/", "").replace(".git", "")
         branch_name = f"spec-to-pr/{session.work_item.work_id}"
 
-        # Use committer agent to handle filtering and committing
-        runner, system_prompt = self._make_runner("committer")
-
-        task = (
-            f"Work ID: {session.work_item.work_id}\n"
-            f"Branch: {branch_name}\n\n"
-            f"You need to commit the changes for this work item.\n\n"
-            f"1. Check `git status` to see what files have changed\n"
-            f"2. Filter out spec-to-pr metadata:\n"
-            f"   - .spec-to-pr/ directory\n"
-            f"   - conversations/ directory\n"
-            f"   - Spec files (*.md files that match the work ID or are in the workspace root)\n"
-            f"3. Create branch '{branch_name}' (use `git checkout -b` if it doesn't exist)\n"
-            f"4. Stage ONLY the filtered implementation files (use `git add <file1> <file2>...`)\n"
-            f"5. Commit with this message format:\n"
-            f"   [{session.work_item.work_id}] <brief description of changes>\n\n"
-            f"   Spec-to-pr automated changes for work item {session.work_item.work_id}\n\n"
-            f"   Co-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>\n\n"
-            f"After committing, report the committed files in this format:\n"
-            f"Committed files: <file1>, <file2>, <file3>\n\n"
-            f"When done, respond with 'Commit complete.'"
-        )
-
-        result = runner.run(
-            system_prompt=system_prompt,
-            task=task,
-            work_id=f"{session.work_item.work_id}-commit"
-        )
-        log.info("Committer agent finished. Summary: %s", result[:300])
-
-        # Parse committed files from agent output
-        import re
-        committed_files_match = re.search(r'Committed files:\s*(.+?)(?:\n|$)', result)
-        committed_files = []
-        if committed_files_match:
-            files_str = committed_files_match.group(1)
-            committed_files = [f.strip() for f in files_str.split(',') if f.strip()]
-            log.info("Parsed %d committed files from agent output", len(committed_files))
-        else:
-            log.warning("Could not parse committed files from agent output, using git diff")
-            # Fallback: check what was actually committed
-            diff_result = subprocess.run(
-                ["git", "diff", "--name-only", "HEAD~1", "HEAD"],
-                capture_output=True,
-                text=True,
-                cwd=self.config.workspace,
-            )
-            if diff_result.returncode == 0:
-                committed_files = [f.strip() for f in diff_result.stdout.strip().split('\n') if f.strip()]
-
-        if not committed_files:
-            log.warning("No committed files detected, skipping repo tracking")
+        repos_with_work = self._find_repos_with_local_work()
+        if not repos_with_work:
+            log.info("No repos with local work found under %s", self.config.workspace)
             return
 
-        # Track in session
-        repo_state = RepoState(
-            repo_name=repo_name,
-            repo_url=repo_url,
-            workspace_path=str(self.config.workspace),
-            branch=branch_name,
-            changes=committed_files,
-            status="committed",
+        log.info("Found %d repo(s) with local work: %s",
+                 len(repos_with_work), [p.name for p in repos_with_work])
+
+        for repo_path in repos_with_work:
+            url_result = subprocess.run(
+                ["git", "remote", "get-url", "origin"],
+                capture_output=True, text=True, cwd=repo_path,
+            )
+            if url_result.returncode != 0:
+                log.warning("No origin remote in %s, skipping", repo_path)
+                continue
+
+            repo_url = url_result.stdout.strip()
+            repo_name = (
+                repo_url
+                .replace("https://github.com/", "")
+                .replace("git@github.com:", "")
+                .removesuffix(".git")
+            )
+
+            runner, system_prompt = self._make_runner("committer", session)
+            task = (
+                f"Work ID: {session.work_item.work_id}\n"
+                f"Branch: {branch_name}\n"
+                f"Repository path: {repo_path}\n\n"
+                f"Commit any outstanding changes in the repository at `{repo_path}`.\n\n"
+                f"1. `cd {repo_path}`\n"
+                f"2. Run `git status --porcelain` to check for uncommitted changes.\n"
+                f"   - If there ARE uncommitted changes: proceed to step 3.\n"
+                f"   - If there are NO uncommitted changes, the developer already committed. "
+                f"Run `git log --oneline --not --remotes` to confirm there are unpushed commits, "
+                f"then skip to step 6 and list those files.\n"
+                f"3. Filter out spec-to-pr metadata — never stage:\n"
+                f"   - .spec-to-pr/ directory\n"
+                f"   - conversations/ directory\n"
+                f"   - Spec *.md files in the workspace root\n"
+                f"4. Create or switch to branch `{branch_name}`: "
+                f"`git checkout -b {branch_name}` or `git checkout {branch_name}`.\n"
+                f"5. Stage only implementation files and commit:\n"
+                f"   [{session.work_item.work_id}] <brief description of what changed>\n\n"
+                f"   Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>\n"
+                f"6. Report committed files as:\n"
+                f"   Committed files: <file1>, <file2>, ...\n\n"
+                f"Respond with 'Commit complete.' when done."
+            )
+
+            result = runner.run(
+                system_prompt=system_prompt,
+                task=task,
+                work_id=f"{session.work_item.work_id}-commit-{repo_path.name}",
+            )
+            log.info("Committer for %s: %s", repo_path.name, result[:300])
+
+            committed_files_match = re.search(r'Committed files:\s*(.+?)(?:\n|$)', result)
+            committed_files = []
+            if committed_files_match:
+                files_str = committed_files_match.group(1)
+                committed_files = [f.strip().strip("`") for f in files_str.split(",") if f.strip()]
+
+            if not committed_files:
+                diff_result = subprocess.run(
+                    ["git", "diff", "--name-only", "HEAD~1", "HEAD"],
+                    capture_output=True, text=True, cwd=repo_path,
+                )
+                if diff_result.returncode == 0:
+                    committed_files = [f.strip() for f in diff_result.stdout.strip().split("\n") if f.strip()]
+
+            if not committed_files:
+                log.warning("No committed files detected for %s, skipping", repo_path.name)
+                continue
+
+            repo_state = RepoState(
+                repo_name=repo_name,
+                repo_url=repo_url,
+                workspace_path=str(repo_path),
+                branch=branch_name,
+                changes=committed_files,
+                status="committed",
+            )
+            session.repos.append(repo_state)
+            log.info("Tracked %s on %s with %d files", repo_name, branch_name, len(committed_files))
+
+    def _find_repos_with_local_work(self) -> list[Path]:
+        """Return git repos under workspace that have uncommitted changes or unpushed commits."""
+        found = []
+        for path in sorted(self.config.workspace.iterdir()):
+            if not path.is_dir() or path.name == "spec-to-pr":
+                continue
+            if not (path / ".git").exists():
+                continue
+            # Uncommitted changes
+            status = subprocess.run(
+                ["git", "status", "--porcelain"],
+                capture_output=True, text=True, cwd=path,
+            )
+            if status.returncode == 0 and status.stdout.strip():
+                found.append(path)
+                continue
+            # Local commits not on any remote
+            ahead = subprocess.run(
+                ["git", "log", "--oneline", "--not", "--remotes"],
+                capture_output=True, text=True, cwd=path,
+            )
+            if ahead.returncode == 0 and ahead.stdout.strip():
+                found.append(path)
+        return found
+
+    # ------------------------------------------------------------------
+    # Shared context log — one markdown file per work item, readable by all agents
+    # ------------------------------------------------------------------
+
+    def _context_log_path(self, session: OrchestratorSession) -> Path:
+        path = self.config.storage_path / session.work_item.work_id / "context.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def _context_log_init(self, session: OrchestratorSession) -> None:
+        path = self._context_log_path(session)
+        if path.exists():
+            return  # preserve across resume
+        now = datetime.now(timezone.utc).isoformat()
+        path.write_text(
+            f"# Context log: {session.work_item.work_id}\n\n"
+            f"Session: {session.session_id}\n"
+            f"Started: {now}\n\n"
+            f"## Spec\n\n"
+            f"{session.work_item.spec_content}\n\n"
+            f"---\n\n"
+            f"*Agents: read this file before starting. Append a brief summary when done.*\n\n"
         )
-        session.repos.append(repo_state)
-        log.info("Tracked repo state: %s on branch %s with %d files",
-                 repo_name, branch_name, len(committed_files))
+
+    def _context_log_append(self, session: OrchestratorSession, heading: str, body: str) -> None:
+        path = self._context_log_path(session)
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        with open(path, "a") as f:
+            f.write(f"## {heading} — {now}\n\n{body.strip()}\n\n")
 
     def _load_project_docs(self) -> None:
         """Load project documentation (CLAUDE.md) to provide environment context."""
@@ -324,19 +411,28 @@ class Orchestrator:
     def _should_run_tests(self, session: OrchestratorSession) -> bool:
         """Use Claude to infer whether testing is needed based on the changes."""
         try:
-            # Get git diff of changes
-            result = subprocess.run(
-                ["git", "diff", "--name-status", "HEAD"],
-                capture_output=True,
-                text=True,
-                cwd=self.config.workspace,
-                timeout=10,
-            )
-            if result.returncode != 0:
-                log.warning("Failed to get git diff, assuming tests needed")
-                return True
+            # Prefer committed file list from session state (post-commit, git diff HEAD is empty)
+            if session.repos and session.repos[0].changes:
+                changed_files = "\n".join(f"M\t{f}" for f in session.repos[0].changes)
+                log.info("Using %d committed files from session state", len(session.repos[0].changes))
+            else:
+                # Fall back to git diff for uncommitted changes
+                primary_cwd = (
+                    Path(session.repos[0].workspace_path) if session.repos
+                    else self.config.workspace
+                )
+                result = subprocess.run(
+                    ["git", "diff", "--name-status", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    cwd=primary_cwd,
+                    timeout=10,
+                )
+                if result.returncode != 0:
+                    log.warning("Failed to get git diff, assuming tests needed")
+                    return True
+                changed_files = result.stdout.strip()
 
-            changed_files = result.stdout.strip()
             if not changed_files:
                 log.info("No file changes detected, skipping tests")
                 return False
@@ -393,20 +489,21 @@ Keep the reason brief (one sentence)."""
             log.warning("Failed to infer test requirement: %s, defaulting to run tests", exc)
             return True
 
-    def _run_make(self, target: str, **kwargs) -> bool:
+    def _run_make(self, target: str, cwd: Path | None = None) -> bool:
+        run_cwd = cwd or self.config.workspace
         result = subprocess.run(
             ["make", target],
             capture_output=True,
             text=True,
-            cwd=self.config.workspace,
-            **kwargs,
+            cwd=run_cwd,
         )
         if result.returncode != 0:
-            log.error("make %s failed:\n%s", target, result.stderr[-2000:])
+            log.error("make %s failed (in %s):\n%s", target, run_cwd, result.stderr[-2000:])
         return result.returncode == 0
 
-    def _make_runner(self, persona_name: str) -> tuple[AgentRunner, str]:
+    def _make_runner(self, persona_name: str, session: OrchestratorSession | None = None) -> tuple[AgentRunner, str]:
         """Return an AgentRunner configured with the given persona's SDK settings."""
+        run_id = session.session_id[:8] if session else None
         try:
             persona = self.persona_loader.load(persona_name)
             sdk_cfg = persona.sdk_config
@@ -415,6 +512,7 @@ Keep the reason brief (one sentence)."""
                 model=sdk_cfg.get("model", "claude-sonnet-4-6"),
                 max_turns=sdk_cfg.get("max_turns", 50),
                 conversations_dir=self.config.conversations_path,
+                run_id=run_id,
             )
             system_prompt = persona.build_system_prompt()
         except FileNotFoundError:
@@ -422,6 +520,7 @@ Keep the reason brief (one sentence)."""
             runner = AgentRunner(
                 workspace=self.config.workspace,
                 conversations_dir=self.config.conversations_path,
+                run_id=run_id,
             )
             system_prompt = "You are a software developer. Implement the requested changes."
 
@@ -433,13 +532,24 @@ Keep the reason brief (one sentence)."""
 
     def _run_claude_agent(self, persona_name: str, session: OrchestratorSession) -> None:
         """Run a Claude SDK agent session for implementation work."""
-        runner, system_prompt = self._make_runner(persona_name)
+        runner, system_prompt = self._make_runner(persona_name, session)
+        ctx_path = self._context_log_path(session)
+
         task = (
             f"Work ID: {session.work_item.work_id}\n"
             f"Attempt: {session.attempt_number}\n\n"
+            f"## Context log\n"
+            f"Read `{ctx_path}` first — it contains the spec, everything learned in "
+            f"previous attempts, and pointers to prior conversation logs you can Read "
+            f"for details.\n\n"
+            f"## Your task\n"
             f"{session.work_item.spec_content}\n\n"
-            "Implement all changes described above. "
-            "When done, respond with 'Implementation complete.'"
+            f"## When done\n"
+            f"Stop calling tools once you have reached a conclusion. Append a brief "
+            f"markdown section to `{ctx_path}` summarising: what you found, what you "
+            f"changed (with file paths), and what still needs work. Include the path to "
+            f"your conversation log if available. Then respond with a final summary "
+            f"followed by exactly: 'Implementation complete.'"
         )
         result = runner.run(
             system_prompt=system_prompt,
@@ -452,15 +562,19 @@ Keep the reason brief (one sentence)."""
         self, persona_name: str, session: OrchestratorSession, previous: list
     ) -> list[str]:
         """Run a debug agent session and return a list of findings."""
-        runner, system_prompt = self._make_runner(persona_name)
-        prev_ctx = "\n".join(
-            f"Attempt {e.attempt_number}: {e.error_summary}" for e in previous
-        )
+        runner, system_prompt = self._make_runner(persona_name, session)
+        ctx_path = self._context_log_path(session)
+
         task = (
-            f"Debug failure for work item {session.work_item.work_id}.\n\n"
-            f"Previous attempts:\n{prev_ctx}\n\n"
-            "Investigate logs, pod state, and recent changes. "
-            "Return a bullet-point list of findings and hypotheses."
+            f"Debug failure for work item {session.work_item.work_id} "
+            f"(attempt {session.attempt_number}).\n\n"
+            f"## Context log\n"
+            f"Read `{ctx_path}` first — it has the full history of what has been tried.\n\n"
+            f"## Your task\n"
+            f"Investigate logs, deployment state, and recent changes. Identify what failed "
+            f"and why. Append your findings to `{ctx_path}` as a markdown section, "
+            f"including the path to your conversation log. Then return a bullet-point list "
+            f"of findings and hypotheses followed by exactly: 'Debug complete.'"
         )
         response = runner.run(
             system_prompt=system_prompt,
@@ -475,30 +589,46 @@ Keep the reason brief (one sentence)."""
 
     def _run_pr_submission_agent(self, repos: list, session: OrchestratorSession) -> None:
         """Run PR submission agent to push branches and create PRs."""
-        runner, system_prompt = self._make_runner("pr-submitter")
+        runner, system_prompt = self._make_runner("pr-submitter", session)
 
         # Build task description with repo info
         repos_info = []
         for repo in repos:
+            files_summary = ", ".join(repo.changes[:10])
+            if len(repo.changes) > 10:
+                files_summary += f" ... ({len(repo.changes)} total)"
             repos_info.append(
                 f"- Repository: {repo.repo_name}\n"
-                f"  Branch: {repo.branch}\n"
+                f"  Branch with changes: {repo.branch}\n"
                 f"  Workspace: {repo.workspace_path}\n"
-                f"  Changed files: {len(repo.changes)}"
+                f"  Changed files: {files_summary}"
             )
+
+        ctx_path = self._context_log_path(session)
 
         task = (
             f"Work ID: {session.work_item.work_id}\n"
             f"Attempt: {session.attempt_number}\n\n"
-            f"You need to push branches and create pull requests for the following repositories:\n\n"
+            f"## Context log\n"
+            f"Read `{ctx_path}` first for full context on what was implemented and why.\n\n"
+            f"## Repositories to publish\n\n"
             f"{chr(10).join(repos_info)}\n\n"
-            f"For each repository:\n"
-            f"1. Inspect `git remote -v` to identify fork and upstream remotes\n"
-            f"2. Push the branch to the fork remote (or origin if no fork exists)\n"
-            f"3. Create a PR against the upstream repository using `gh pr create`\n\n"
-            f"PR details:\n"
-            f"- Title: [{session.work_item.work_id}] Automated implementation\n"
-            f"- Body: Include work ID, attempt number ({session.attempt_number}), and 'Generated by spec-to-pr'\n\n"
+            f"For each repository listed above:\n"
+            f"1. cd to the Workspace path\n"
+            f"2. Run `git remote -v` to identify fork and upstream remotes\n"
+            f"3. Run `git log --oneline -10` and `git branch -r` to understand the branch history\n"
+            f"4. Determine the correct base branch for the PR:\n"
+            f"   - If the spec is fixing a problem IN a specific PR or branch, target that PR's branch\n"
+            f"   - If the spec is a standalone feature or fix, target the upstream default branch\n"
+            f"   - Use `git log --not --remotes --format=%P | tail -1 | xargs git branch -r --contains 2>/dev/null` "
+            f"to find where the local commits diverged from remote history\n"
+            f"5. Use `gh api` to push the branch to the fork remote (do NOT use `git push`)\n"
+            f"6. Generate a meaningful PR title and body from the spec and changed files:\n"
+            f"   - Title: concise summary of what was actually fixed or changed\n"
+            f"   - Body: what problem was solved, key files changed, work ID ({session.work_item.work_id}), "
+            f"attempt {session.attempt_number}, 'Generated by spec-to-pr'\n"
+            f"7. Create the PR: `gh pr create --repo <upstream> --head <fork>:<branch> "
+            f"--base <detected-base> --title '...' --body '...'`\n\n"
             f"After creating each PR, report the PR URL in the format:\n"
             f"PR created for <repo-name>: <url>\n\n"
             f"When all PRs are created, respond with 'PR submission complete.'"

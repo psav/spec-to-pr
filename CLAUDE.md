@@ -2,6 +2,19 @@
 
 Autonomous spec-to-pull-request orchestrator. Ingests a feature spec (JIRA ticket, markdown file, or inline text), spawns Claude Agent SDK sessions to implement code and E2E tests, deploys to an ephemeral environment, runs tests with a debug/retry loop, and creates PRs on success. A circuit breaker escalates to humans after repeated failures.
 
+## Workspace layout (non-negotiable)
+
+`/workspace` is the shared root. spec-to-pr itself lives at `/workspace/spec-to-pr`. Every target repository the developer agent clones must be placed as a sibling at `/workspace/<repo-name>` — never inside `/workspace/spec-to-pr`. This is enforced by `run-spec.sh`, which mounts `/workspace` (not the spec-to-pr subdirectory) as the container workspace.
+
+```
+/workspace/
+  spec-to-pr/               ← this tool
+  rosa-regional-platform/   ← cloned by the developer agent
+  some-other-repo/          ← cloned by the developer agent
+```
+
+The committer and pr-submitter agents operate inside the cloned target repo, not inside spec-to-pr. Any agent that needs to commit or push must `cd` to the correct repo path before running git commands.
+
 ## Quick reference
 
 ```bash

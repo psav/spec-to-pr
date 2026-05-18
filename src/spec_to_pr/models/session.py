@@ -31,6 +31,7 @@ class RepoState:
     repo_url: str
     workspace_path: str
     branch: str = "main"
+    base_branch: str = "main"
     changes: list[str] = field(default_factory=list)
     pr_url: Optional[str] = None
     status: str = "clean"

@@ -38,6 +38,7 @@ class WorkItem:
     source_type: SourceType
     source_ref: str
     spec_content: str = ""
+    title: str = ""
 
     @classmethod
     def from_jira(cls, jira_id: str) -> WorkItem:
@@ -52,18 +53,23 @@ class WorkItem:
         text = p.read_text()
         fm, body = _parse_frontmatter(text)
         work_id = fm.get("work_id") or _generate_spec_id()
+        title = fm.get("title") or _extract_title_from_body(body)
         return cls(
             work_id=work_id,
             source_type=SourceType.FILE,
             source_ref=path,
             spec_content=text,
+            title=title,
         )
 
     @classmethod
     def from_inline(cls, text: str) -> WorkItem:
+        fm, body = _parse_frontmatter(text)
+        title = fm.get("title") or _extract_title_from_body(body)
         return cls(
             work_id=_generate_spec_id(),
             source_type=SourceType.INLINE,
             source_ref="inline",
             spec_content=text,
+            title=title,
         )
