@@ -31,6 +31,12 @@ class Persona:
     body: str = ""
 
     def build_system_prompt(self, phase_context: Optional[str] = None) -> str:
+        if self.body:
+            prompt = self.body
+            if phase_context:
+                prompt += f"\n\n## Current Context\n{phase_context}"
+            return prompt
+
         lines = [
             f"You are {self.name} — {self.description}.",
             "",

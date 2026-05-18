@@ -107,6 +107,12 @@ _DISALLOWED_BASH = re.compile(
     r"\b(rm\s+-rf|git\s+push|git\s+reset\s+--hard|chmod\s+777|curl\s+.*\|\s*sh|wget\s+.*\|\s*sh)\b"
 )
 
+# Phrases that signal the agent has finished its work and should stop
+_DONE_SIGNALS = re.compile(
+    r"(Implementation complete|Debug complete|Commit complete|PR submission complete)\.",
+    re.IGNORECASE,
+)
+
 
 class AgentRunner:
     """
@@ -119,11 +125,13 @@ class AgentRunner:
         model: str = "claude-sonnet-4-6",
         max_turns: int = 50,
         conversations_dir: Path | None = None,
+        run_id: str | None = None,
     ) -> None:
         self.workspace = Path(workspace)
         self.model = model
         self.max_turns = max_turns
         self.conversations_dir = Path(conversations_dir) if conversations_dir else None
+        self.run_id = run_id  # short session ID for grouping conversation files
         if _VERTEX_PROJECT:
             # CLAUDE_CODE_SKIP_VERTEX_AUTH=1: proxy injects real credentials at the network layer.
             # Pass a dummy access_token so AnthropicVertex skips google.auth ADC lookup.
@@ -146,95 +154,121 @@ class AgentRunner:
         """
         messages: list[dict] = [{"role": "user", "content": task}]
         final_text = ""
+        label = f"[{work_id}]" if work_id else "[agent]"
 
-        for turn in range(self.max_turns):
-            log.debug("Agent turn %d", turn + 1)
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=8096,
-                system=system_prompt,
-                tools=_TOOL_DEFINITIONS,
-                messages=messages,
-            )
+        conv_file = self._open_conversation_log(work_id, system_prompt)
 
-            # Collect text from this response
-            text_parts = [b.text for b in response.content if hasattr(b, "text")]
-            if text_parts:
-                final_text = "\n".join(text_parts)
-                log.debug("Agent: %s", final_text[:200])
+        try:
+            for turn in range(self.max_turns):
+                log.debug("Agent turn %d", turn + 1)
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=8096,
+                    system=system_prompt,
+                    tools=_TOOL_DEFINITIONS,
+                    messages=messages,
+                )
 
-            if response.stop_reason == "end_turn":
-                log.info("Agent finished after %d turns", turn + 1)
-                break
+                # Collect text from this response and print immediately
+                text_parts = [b.text for b in response.content if hasattr(b, "text")]
+                if text_parts:
+                    final_text = "\n".join(text_parts)
+                    print(f"{label} {final_text}", flush=True)
 
-            if response.stop_reason != "tool_use":
-                log.warning("Unexpected stop_reason=%r", response.stop_reason)
-                break
-
-            # Process tool calls and build tool results
-            tool_results = []
-            for block in response.content:
-                if block.type != "tool_use":
-                    continue
-                result = self._dispatch_tool(block.name, block.input)
-                log.debug("Tool %s → %s", block.name, str(result)[:120])
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": str(result),
+                self._log_entry(conv_file, {
+                    "type": "assistant",
+                    "turn": turn + 1,
+                    "content": self._serialize_content(response.content),
+                    "stop_reason": response.stop_reason,
                 })
 
-            # Append assistant turn + tool results to messages
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({"role": "user", "content": tool_results})
-        else:
-            log.warning("Agent hit max_turns=%d without finishing", self.max_turns)
+                if response.stop_reason == "end_turn":
+                    log.info("Agent finished after %d turns", turn + 1)
+                    break
 
-        # Save conversation transcript if conversations_dir is configured
-        if self.conversations_dir and work_id:
-            self._save_conversation(work_id, system_prompt, messages, final_text)
+                # Also stop early if the agent has signalled completion in its text
+                if final_text and _DONE_SIGNALS.search(final_text):
+                    log.info("Agent signalled completion after %d turns — stopping early", turn + 1)
+                    break
+
+                if response.stop_reason != "tool_use":
+                    log.warning("Unexpected stop_reason=%r", response.stop_reason)
+                    break
+
+                # Process tool calls and build tool results
+                tool_results = []
+                for block in response.content:
+                    if block.type != "tool_use":
+                        continue
+                    tool_input_summary = ", ".join(
+                        f"{k}={str(v)[:60]}" for k, v in block.input.items()
+                    )
+                    print(f"{label} → {block.name}({tool_input_summary})", flush=True)
+                    result = self._dispatch_tool(block.name, block.input)
+                    result_str = str(result)
+                    print(f"{label} ← {result_str[:200]}", flush=True)
+                    self._log_entry(conv_file, {
+                        "type": "tool_call",
+                        "turn": turn + 1,
+                        "tool": block.name,
+                        "input": block.input,
+                        "result": result_str,
+                    })
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result_str,
+                    })
+
+                # Append assistant turn + tool results to messages
+                messages.append({"role": "assistant", "content": response.content})
+                messages.append({"role": "user", "content": tool_results})
+            else:
+                log.warning("Agent hit max_turns=%d without finishing", self.max_turns)
+
+        finally:
+            self._log_entry(conv_file, {"type": "result", "final_text": final_text})
+            if conv_file:
+                conv_file.close()
 
         return final_text
 
-    def _save_conversation(
-        self, work_id: str, system_prompt: str, messages: list[dict], final_text: str
-    ) -> None:
-        """Save the conversation transcript to the conversations directory."""
+    def _open_conversation_log(self, work_id: str | None, system_prompt: str):
+        """Open a JSONL conversation log file and write the metadata header."""
+        if not (self.conversations_dir and work_id):
+            return None
         try:
             self.conversations_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-            filename = f"{work_id}_{timestamp}.jsonl"
-            filepath = self.conversations_dir / filename
-
-            with open(filepath, 'w') as f:
-                # Write metadata header
-                f.write(json.dumps({
-                    "type": "metadata",
-                    "work_id": work_id,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "model": self.model,
-                    "system_prompt": system_prompt,
-                }) + '\n')
-
-                # Write each message turn
-                for msg in messages:
-                    f.write(json.dumps({
-                        "type": "message",
-                        "role": msg["role"],
-                        "content": self._serialize_content(msg["content"])
-                    }) + '\n')
-
-                # Write final result
-                f.write(json.dumps({
-                    "type": "result",
-                    "final_text": final_text,
-                }) + '\n')
-
-            log.info("Conversation saved to %s", filepath)
+            run_part = f"_r{self.run_id}" if self.run_id else ""
+            filepath = self.conversations_dir / f"{work_id}{run_part}_{timestamp}.jsonl"
+            f = open(filepath, "w")
+            f.write(json.dumps({
+                "type": "metadata",
+                "work_id": work_id,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "model": self.model,
+                "system_prompt": system_prompt,
+            }) + "\n")
+            f.flush()
+            log.info("Conversation log: %s", filepath)
+            return f
         except Exception as e:
-            log.warning("Failed to save conversation: %s", e)
+            log.warning("Failed to open conversation log: %s", e)
+            return None
 
-    def _serialize_content(self, content: Any) -> Any:
+    @staticmethod
+    def _log_entry(conv_file, entry: dict) -> None:
+        """Write one JSONL entry and flush immediately."""
+        if conv_file is None:
+            return
+        try:
+            conv_file.write(json.dumps(entry, default=str) + "\n")
+            conv_file.flush()
+        except Exception:
+            pass
+
+    def _serialize_content(self, content: Any) -> Any:  # noqa: PLR0911
         """Serialize content for JSON storage, handling SDK objects."""
         if isinstance(content, str):
             return content
