@@ -220,6 +220,30 @@ class AgentRunner:
                         "content": result_str,
                     })
 
+                # Warn the agent when approaching the turn limit so it can write a
+                # progress summary and exit cleanly rather than being cut off mid-task.
+                turns_remaining = self.max_turns - turn - 1
+                warning_threshold = max(5, self.max_turns // 10)
+                if 0 < turns_remaining <= warning_threshold:
+                    log.warning(
+                        "Approaching max_turns: %d of %d used, %d remaining — injecting warning",
+                        turn + 1, self.max_turns, turns_remaining,
+                    )
+                    tool_results.append({
+                        "type": "text",
+                        "text": (
+                            f"[TURN LIMIT WARNING] You have {turns_remaining} turn(s) remaining "
+                            f"(of {self.max_turns} total). Stop your current work now. "
+                            f"Write a progress summary to the context log (the path was given "
+                            f"in your original task): what was accomplished, what is still "
+                            f"pending, and the current state of any local repos and branches. "
+                            f"Then stop calling tools and respond with your summary followed by "
+                            f"'Implementation complete.' so the orchestrator can retry with a "
+                            f"fresh agent that reads your summary and continues from where you "
+                            f"left off."
+                        ),
+                    })
+
                 # Append assistant turn + tool results to messages
                 messages.append({"role": "assistant", "content": response.content})
                 messages.append({"role": "user", "content": tool_results})

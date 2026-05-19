@@ -32,6 +32,15 @@ def _generate_spec_id() -> str:
     return f"SPEC-{short}"
 
 
+def _extract_title_from_body(body: str) -> str:
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith("# "):
+            return line[2:].strip()
+    first_line = body.strip().splitlines()[0] if body.strip() else ""
+    return first_line[:80]
+
+
 @dataclass
 class WorkItem:
     work_id: str

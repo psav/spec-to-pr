@@ -52,6 +52,13 @@ def _build_parser() -> argparse.ArgumentParser:
     validate_p = sub.add_parser("validate", help="Validate a spec file without running the orchestrator")
     validate_p.add_argument("--file", required=True, metavar="PATH", help="Path to a spec markdown file")
 
+    # ---- generate ----
+    gen_p = sub.add_parser("generate", help="Generate a spec file from a plain-English task description")
+    gen_p.add_argument("task", metavar="TASK", help="Plain-English description of what to do")
+    gen_p.add_argument("--output", "-o", metavar="PATH", help="Output spec file path (default: auto-named in current dir)")
+    gen_p.add_argument("--agents", default="/opt/spec-to-pr/.claude/agents", metavar="PATH")
+    gen_p.add_argument("--conversations", default="/spec-to-pr-data/conversations", metavar="PATH")
+
     return parser
 
 
@@ -73,13 +80,19 @@ def _cmd_run(args: argparse.Namespace) -> int:
     else:
         work_item = WorkItem.from_inline(args.inline)
 
+    # Honour skip_deploy from spec frontmatter if not already set via CLI flag
+    skip_deploy = args.skip_deploy
+    if not skip_deploy:
+        fm, _ = _parse_frontmatter(work_item.spec_content)
+        skip_deploy = bool(fm.get("skip_deploy", False))
+
     config = Config(
         storage_path=Path(args.storage),
         agents_path=Path(args.agents),
         conversations_path=Path(args.conversations),
         project_docs_path=Path(args.project_docs) if args.project_docs else None,
         max_attempts=args.max_attempts,
-        skip_deploy=args.skip_deploy,
+        skip_deploy=skip_deploy,
     )
     orch = Orchestrator(config)
     session = orch.run(work_item, dry_run=args.dry_run)
@@ -132,6 +145,57 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_generate(args: argparse.Namespace) -> int:
+    import re
+    from spec_to_pr.agent_runner import AgentRunner
+    from spec_to_pr.personas import PersonaLoader
+
+    agents_path = Path(args.agents)
+    conversations_path = Path(args.conversations)
+
+    # Determine output path
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        slug = re.sub(r"[^a-z0-9]+", "-", args.task.lower())[:40].strip("-")
+        output_path = Path(f"{slug}.md")
+
+    output_path = output_path.resolve()
+
+    loader = PersonaLoader(agents_path)
+    try:
+        persona = loader.load("spec-generator")
+        sdk_cfg = persona.sdk_config
+        system_prompt = persona.build_system_prompt()
+    except FileNotFoundError:
+        print("Error: spec-generator persona not found", file=sys.stderr)
+        return 1
+
+    runner = AgentRunner(
+        workspace=Path.cwd(),
+        model=sdk_cfg.get("model", "claude-sonnet-4-6"),
+        max_turns=sdk_cfg.get("max_turns", 20),
+        conversations_dir=conversations_path,
+    )
+
+    task = (
+        f"Task: {args.task}\n\n"
+        f"Output path: {output_path}\n\n"
+        f"Research what you need using gh CLI, then generate the spec and write it to the output path. "
+        f"Respond with exactly: 'Spec generated: {output_path}'"
+    )
+
+    result = runner.run(system_prompt=system_prompt, task=task, work_id="spec-gen")
+
+    if output_path.exists():
+        print(f"Spec written to: {output_path}")
+        return 0
+    else:
+        print(f"Error: spec file was not created at {output_path}", file=sys.stderr)
+        print(f"Agent response: {result[:200]}", file=sys.stderr)
+        return 1
+
+
 def _cmd_resume(args: argparse.Namespace) -> int:
     config = Config(
         storage_path=Path(args.storage),
@@ -156,5 +220,6 @@ def main() -> None:
         "status": _cmd_status,
         "resume": _cmd_resume,
         "validate": _cmd_validate,
+        "generate": _cmd_generate,
     }
     sys.exit(dispatch[args.command](args))

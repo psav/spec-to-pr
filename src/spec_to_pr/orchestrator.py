@@ -353,7 +353,7 @@ class Orchestrator:
                 continue
             # Local commits not on any remote
             ahead = subprocess.run(
-                ["git", "log", "--oneline", "--not", "--remotes"],
+                ["git", "log", "HEAD", "--oneline", "--not", "--remotes"],
                 capture_output=True, text=True, cwd=path,
             )
             if ahead.returncode == 0 and ahead.stdout.strip():
@@ -391,22 +391,34 @@ class Orchestrator:
             f.write(f"## {heading} — {now}\n\n{body.strip()}\n\n")
 
     def _load_project_docs(self) -> None:
-        """Load project documentation (CLAUDE.md) to provide environment context."""
-        try:
-            # Try explicit path first
-            if self.config.project_docs_path and self.config.project_docs_path.exists():
-                doc_path = self.config.project_docs_path
-            else:
-                # Auto-discover CLAUDE.md in workspace
-                doc_path = self.config.workspace / "CLAUDE.md"
-                if not doc_path.exists():
-                    log.debug("No CLAUDE.md found at %s", doc_path)
-                    return
+        """Load project documentation to provide environment and project context to agents."""
+        parts = []
 
-            self._project_docs = doc_path.read_text()
-            log.info("Loaded project documentation from %s (%d chars)", doc_path, len(self._project_docs))
-        except Exception as exc:
-            log.warning("Failed to load project documentation: %s", exc)
+        # Always load workspace-root CLAUDE.md — it explains the container/proxy environment
+        # (dummy GITHUB_TOKEN, proxy-injected auth, no git push, use gh api instead, etc.)
+        workspace_claude = self.config.workspace / "CLAUDE.md"
+        if workspace_claude.exists():
+            try:
+                parts.append(workspace_claude.read_text())
+                log.info("Loaded workspace environment docs from %s", workspace_claude)
+            except Exception as exc:
+                log.warning("Failed to load workspace CLAUDE.md: %s", exc)
+
+        # Also load any explicitly-specified project docs (e.g. spec-to-pr's own CLAUDE.md)
+        if self.config.project_docs_path:
+            if self.config.project_docs_path.exists():
+                try:
+                    text = self.config.project_docs_path.read_text()
+                    parts.append(text)
+                    log.info("Loaded project docs from %s (%d chars)", self.config.project_docs_path, len(text))
+                except Exception as exc:
+                    log.warning("Failed to load project docs from %s: %s", self.config.project_docs_path, exc)
+            else:
+                log.debug("Project docs path not found: %s", self.config.project_docs_path)
+
+        self._project_docs = "\n\n---\n\n".join(parts) if parts else None
+        if self._project_docs:
+            log.info("Total project documentation: %d chars", len(self._project_docs))
 
     def _should_run_tests(self, session: OrchestratorSession) -> bool:
         """Use Claude to infer whether testing is needed based on the changes."""
@@ -429,8 +441,8 @@ class Orchestrator:
                     timeout=10,
                 )
                 if result.returncode != 0:
-                    log.warning("Failed to get git diff, assuming tests needed")
-                    return True
+                    log.warning("Failed to get git diff, skipping tests")
+                    return False
                 changed_files = result.stdout.strip()
 
             if not changed_files:
@@ -613,25 +625,40 @@ Keep the reason brief (one sentence)."""
             f"Read `{ctx_path}` first for full context on what was implemented and why.\n\n"
             f"## Repositories to publish\n\n"
             f"{chr(10).join(repos_info)}\n\n"
-            f"For each repository listed above:\n"
-            f"1. cd to the Workspace path\n"
-            f"2. Run `git remote -v` to identify fork and upstream remotes\n"
-            f"3. Run `git log --oneline -10` and `git branch -r` to understand the branch history\n"
-            f"4. Determine the correct base branch for the PR:\n"
-            f"   - If the spec is fixing a problem IN a specific PR or branch, target that PR's branch\n"
-            f"   - If the spec is a standalone feature or fix, target the upstream default branch\n"
-            f"   - Use `git log --not --remotes --format=%P | tail -1 | xargs git branch -r --contains 2>/dev/null` "
-            f"to find where the local commits diverged from remote history\n"
-            f"5. Use `gh api` to push the branch to the fork remote (do NOT use `git push`)\n"
-            f"6. Generate a meaningful PR title and body from the spec and changed files:\n"
-            f"   - Title: concise summary of what was actually fixed or changed\n"
-            f"   - Body: what problem was solved, key files changed, work ID ({session.work_item.work_id}), "
-            f"attempt {session.attempt_number}, 'Generated by spec-to-pr'\n"
-            f"7. Create the PR: `gh pr create --repo <upstream> --head <fork>:<branch> "
-            f"--base <detected-base> --title '...' --body '...'`\n\n"
-            f"After creating each PR, report the PR URL in the format:\n"
+            f"For each repository, follow this decision tree exactly.\n\n"
+            f"### Step 1 — understand the branch topology\n"
+            f"- `git remote -v` — identify all remotes. Note which URL belongs to `rrp-bot` (our bot's fork).\n"
+            f"- `git log --not --remotes --oneline` — commits that exist locally but not on any remote yet.\n"
+            f"- Find the divergence point (parent of the oldest local-only commit):\n"
+            f"  `git log --not --remotes --format='%P' | tail -1`\n"
+            f"- Find which remote branch contains that divergence point:\n"
+            f"  `git branch -r --contains <divergence-sha>`\n"
+            f"  This is the **source branch** — the branch these commits were built on top of.\n"
+            f"- Note the owner of the source branch's remote (e.g. `rrp-bot`, `openshift-online`, or a third party).\n\n"
+            f"### Step 2 — push and decide on a PR\n\n"
+            f"**Case A — source branch is on our fork (`rrp-bot`)**\n"
+            f"e.g. `origin/psav/vpc_move-rebased` where origin = `rrp-bot/...`\n"
+            f"- Push the new commits back to that same branch on the rrp-bot fork via `gh api` PATCH.\n"
+            f"- Check for an existing open PR: "
+            f"`gh pr list --repo <upstream> --head rrp-bot:<source-branch-name> --state open --json number,url`\n"
+            f"- If PR exists: report its URL. **Do NOT open a new PR.** The push already updated it.\n"
+            f"- If no PR: open one against the upstream default branch.\n\n"
+            f"**Case B — source branch is on a third-party fork (not `rrp-bot`, not upstream)**\n"
+            f"e.g. the branch lives on `someone-else/repo` — we do not own that fork.\n"
+            f"- Push our fix as a new branch to the **rrp-bot fork** via `gh api` POST.\n"
+            f"- Open a PR from `rrp-bot:<our-branch>` → `<third-party-owner>:<source-branch-name>`\n"
+            f"  on the upstream repo. This contributes the fix to their PR, not to main.\n"
+            f"  Do NOT target main — that would claim their work.\n\n"
+            f"**Case C — source branch is on upstream (e.g. `upstream/main`) or unknown**\n"
+            f"- Push as a new branch to the rrp-bot fork via `gh api` POST.\n"
+            f"- Open a PR against the upstream default branch.\n\n"
+            f"### Step 3 — PR content (when opening a new PR)\n"
+            f"`gh pr create --repo <upstream> --head <fork-owner>:<branch> --base <base> --title '...' --body '...'`\n"
+            f"Body: what problem was solved, key files changed, "
+            f"work ID ({session.work_item.work_id}), 'Generated by spec-to-pr'\n\n"
+            f"After handling each repo, report the PR URL as:\n"
             f"PR created for <repo-name>: <url>\n\n"
-            f"When all PRs are created, respond with 'PR submission complete.'"
+            f"When all repos are handled, respond with 'PR submission complete.'"
         )
 
         result = runner.run(

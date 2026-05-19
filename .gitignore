@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+
+# pytest
+.pytest_cache/
+
+# uv
+uv.lock
+
+# spec-to-pr runtime data
+.spec-to-pr/
+
+# Container build artifacts
+proxy-ca.crt
