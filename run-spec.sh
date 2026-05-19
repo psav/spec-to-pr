@@ -31,6 +31,7 @@ _common_args() {
     -e "https_proxy=${https_proxy}" \
     -e "http_proxy=${http_proxy}" \
     -e "AWS_CA_BUNDLE=${AWS_CA_BUNDLE:-}" \
+    -e "REVIEW_ESCALATION_USER=${REVIEW_ESCALATION_USER:-psav}" \
     "$@"
 }
 
@@ -69,6 +70,19 @@ case "${SUBCOMMAND}" in
     _common_args spec-to-pr generate "$TASK" "${OUTPUT_ARGS[@]}"
     ;;
 
+  review)
+    PR_REF="${2:-}"
+    if [[ -z "$PR_REF" ]]; then
+      echo "Usage: $0 review <pr-url> [--since <ISO-timestamp>]"
+      exit 1
+    fi
+    shift 2
+    echo "Reviewing PR: $PR_REF"
+    _common_args spec-to-pr review "$PR_REF" \
+      --project-docs /workspace/spec-to-pr/CLAUDE.md \
+      "$@"
+    ;;
+
   *)
     # Legacy: bare spec file path (backwards compat)
     if [[ -n "$SUBCOMMAND" && -f "$SUBCOMMAND" ]]; then
@@ -81,6 +95,7 @@ case "${SUBCOMMAND}" in
       echo "Usage:"
       echo "  $0 run <path-to-spec.md>"
       echo "  $0 generate \"task description\" [-o output.md]"
+      echo "  $0 review <pr-url> [--since <ISO-timestamp>]"
       exit 1
     fi
     ;;

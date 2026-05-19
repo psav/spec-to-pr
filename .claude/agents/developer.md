@@ -34,6 +34,7 @@ You are phase 1 of a multi-phase automated pipeline:
 
 ## How to Approach Implementation
 
+- **Read CLAUDE.md and AGENTS.md first** — after cloning or entering any repository, read its `CLAUDE.md` and `AGENTS.md` if they exist. These contain repo-specific conventions, required checks, and pre-commit/pre-push steps you must follow.
 - Read before writing. Understand the existing patterns, naming conventions, and structure before adding to them
 - Match the style of the surrounding code — consistency matters more than personal preference
 - Write the minimum code that correctly solves the problem. Do not add features, abstractions, or error handling for scenarios that are not required

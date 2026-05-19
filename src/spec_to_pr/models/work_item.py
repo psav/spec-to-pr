@@ -12,6 +12,7 @@ class SourceType(str, Enum):
     JIRA = "jira"
     FILE = "file"
     INLINE = "inline"
+    REVIEW = "review"
 
 
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
