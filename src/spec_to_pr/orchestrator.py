@@ -148,6 +148,10 @@ class Orchestrator:
             self.state_machine.transition(session, implementation_complete=False)
 
     def _deploy(self, session: OrchestratorSession) -> None:
+        if self.config.skip_deploy:
+            log.info("skip_deploy=True — skipping deployment, jumping to PR submission")
+            session.current_phase = Phase.PR_SUBMISSION
+            return
         log.info("Deploying to ephemeral environment")
         cwd = Path(session.repos[0].workspace_path) if session.repos else self.config.workspace
         log.info("Running make ephemeral-provision in %s", cwd)
@@ -550,6 +554,12 @@ Keep the reason brief (one sentence)."""
         task = (
             f"Work ID: {session.work_item.work_id}\n"
             f"Attempt: {session.attempt_number}\n\n"
+            f"## Your phase: IMPLEMENTATION\n"
+            f"You are in phase 1 of the pipeline. Your job is to make code changes on disk only.\n"
+            f"Do NOT `git add`, `git commit`, create branches, `git push`, or open PRs.\n"
+            f"The Committer and PR Submitter agents handle those steps after you finish.\n"
+            f"If the spec contains 'Committer notes' or 'PR Submitter notes' sections, read them\n"
+            f"for context but do not act on them — those are instructions for later agents.\n\n"
             f"## Context log\n"
             f"Read `{ctx_path}` first — it contains the spec, everything learned in "
             f"previous attempts, and pointers to prior conversation logs you can Read "

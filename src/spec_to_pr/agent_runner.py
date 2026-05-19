@@ -104,7 +104,7 @@ _TOOL_DEFINITIONS: list[dict] = [
 ]
 
 _DISALLOWED_BASH = re.compile(
-    r"\b(rm\s+-rf|git\s+push|git\s+reset\s+--hard|chmod\s+777|curl\s+.*\|\s*sh|wget\s+.*\|\s*sh)\b"
+    r"\b(rm\s+-rf|git\s+reset\s+--hard|chmod\s+777|curl\s+.*\|\s*sh|wget\s+.*\|\s*sh)\b"
 )
 
 # Phrases that signal the agent has finished its work and should stop

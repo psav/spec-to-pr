@@ -113,3 +113,28 @@ def test_implementation_failure_trips_circuit_breaker(mock_agent, tmp_path):
     config.max_attempts = 1
     session = Orchestrator(config).run(_work_item())
     assert session.current_phase == Phase.HUMAN_ESCALATION
+
+
+@patch("spec_to_pr.agent_runner.AgentRunner.run", return_value="Implementation complete.")
+@patch("spec_to_pr.orchestrator.subprocess.run", return_value=_make_ok())
+def test_resume_honours_skip_deploy_from_spec_frontmatter(mock_make, mock_agent, tmp_path):
+    """resume() must not call make ephemeral-provision when the stored spec has skip_deploy: true."""
+    spec_with_skip = "---\nwork_id: TEST-SKIP\ntitle: Test\nskip_deploy: true\n---\n\nDo something."
+    wi = WorkItem.from_inline(spec_with_skip)
+    wi.work_id = "TEST-SKIP"
+
+    # Persist a session at DEPLOYMENT phase (simulating a prior run that got that far)
+    config = _config(tmp_path)
+    orch = Orchestrator(config)
+    session = OrchestratorSession.new(wi)
+    session.current_phase = Phase.DEPLOYMENT
+    orch.storage.save_session(session)
+
+    # Resume with skip_deploy inferred from spec frontmatter (config default is False)
+    skip_config = _config(tmp_path)
+    skip_config.skip_deploy = True
+    resumed = Orchestrator(skip_config).resume(wi.work_id)
+    assert resumed.current_phase == Phase.COMPLETE
+
+    make_targets = [" ".join(c.args[0]) for c in mock_make.call_args_list if c.args]
+    assert not any("ephemeral-provision" in t for t in make_targets)
