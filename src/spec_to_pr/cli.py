@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -59,6 +60,20 @@ def _build_parser() -> argparse.ArgumentParser:
     gen_p.add_argument("--output", "-o", metavar="PATH", help="Output spec file path (default: auto-named in current dir)")
     gen_p.add_argument("--agents", default="/opt/spec-to-pr/.claude/agents", metavar="PATH")
     gen_p.add_argument("--conversations", default="/spec-to-pr-data/conversations", metavar="PATH")
+
+    # ---- review ----
+    review_p = sub.add_parser("review", help="Fetch PR review comments and address them via the implementation pipeline")
+    review_p.add_argument("pr", metavar="PR", help="PR URL (https://github.com/org/repo/pull/N) or org/repo#N")
+    review_p.add_argument("--since", metavar="TIMESTAMP", help="Skip if PR not updated after this ISO 8601 timestamp")
+    review_p.add_argument(
+        "--escalation-user", metavar="USER",
+        default=os.environ.get("REVIEW_ESCALATION_USER", ""),
+        help="GitHub username to tag when a comment needs human input (env: REVIEW_ESCALATION_USER)",
+    )
+    review_p.add_argument("--storage", default="/spec-to-pr-data/sessions", metavar="PATH")
+    review_p.add_argument("--agents", default="/opt/spec-to-pr/.claude/agents", metavar="PATH")
+    review_p.add_argument("--conversations", default="/spec-to-pr-data/conversations", metavar="PATH")
+    review_p.add_argument("--project-docs", metavar="PATH")
 
     return parser
 
@@ -197,6 +212,27 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         return 1
 
 
+def _cmd_review(args: argparse.Namespace) -> int:
+    config = Config(
+        storage_path=Path(args.storage),
+        agents_path=Path(args.agents),
+        conversations_path=Path(args.conversations),
+        project_docs_path=Path(args.project_docs) if args.project_docs else None,
+        skip_deploy=True,
+    )
+    orch = Orchestrator(config)
+    session = orch.review(
+        pr_ref=args.pr,
+        since=getattr(args, "since", None),
+        escalation_user=args.escalation_user,
+    )
+    if session is None:
+        print("No new review activity — nothing to do.")
+        return 0
+    print(f"\nFinal phase: {session.current_phase.value}")
+    return 0 if session.current_phase.value == "complete" else 1
+
+
 def _cmd_resume(args: argparse.Namespace) -> int:
     storage = FileStorage(Path(args.storage))
     session = storage.load_session(args.work_id)
@@ -232,5 +268,6 @@ def main() -> None:
         "resume": _cmd_resume,
         "validate": _cmd_validate,
         "generate": _cmd_generate,
+        "review": _cmd_review,
     }
     sys.exit(dispatch[args.command](args))
