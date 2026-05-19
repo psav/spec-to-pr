@@ -47,6 +47,7 @@ def _build_parser() -> argparse.ArgumentParser:
     resume_p.add_argument("--conversations", default="/tmp/.spec-to-pr/conversations", metavar="PATH")
     resume_p.add_argument("--project-docs", metavar="PATH", help="Path to CLAUDE.md or project docs (auto-discovers if not specified)")
     resume_p.add_argument("--max-attempts", type=int, default=3, metavar="N")
+    resume_p.add_argument("--skip-deploy", action="store_true", default=False, help="Skip deployment and E2E phases, go straight to PR submission")
 
     # ---- validate ----
     validate_p = sub.add_parser("validate", help="Validate a spec file without running the orchestrator")
@@ -197,12 +198,22 @@ def _cmd_generate(args: argparse.Namespace) -> int:
 
 
 def _cmd_resume(args: argparse.Namespace) -> int:
+    storage = FileStorage(Path(args.storage))
+    session = storage.load_session(args.work_id)
+
+    # Honour skip_deploy from the stored spec frontmatter (same logic as _cmd_run)
+    skip_deploy = getattr(args, "skip_deploy", False)
+    if not skip_deploy and session is not None:
+        fm, _ = _parse_frontmatter(session.work_item.spec_content)
+        skip_deploy = bool(fm.get("skip_deploy", False))
+
     config = Config(
         storage_path=Path(args.storage),
         agents_path=Path(args.agents),
         conversations_path=Path(args.conversations),
         project_docs_path=Path(args.project_docs) if args.project_docs else None,
         max_attempts=args.max_attempts,
+        skip_deploy=skip_deploy,
     )
     orch = Orchestrator(config)
     session = orch.resume(args.work_id)
