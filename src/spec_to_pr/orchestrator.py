@@ -58,6 +58,151 @@ class Orchestrator:
         self._context_log_init(session)
         return self._run_loop(session)
 
+    def review(
+        self,
+        pr_ref: str,
+        since: str | None = None,
+        escalation_user: str = "",
+    ) -> OrchestratorSession | None:
+        """Fetch open review comments on a PR and address them via the implementation pipeline."""
+        import json
+        import re
+
+        url_match = re.match(r"https://github\.com/([^/]+/[^/]+)/pull/(\d+)", pr_ref)
+        hash_match = re.match(r"([^/]+/[^/]+)#(\d+)", pr_ref)
+        if url_match:
+            repo, pr_number = url_match.group(1), int(url_match.group(2))
+        elif hash_match:
+            repo, pr_number = hash_match.group(1), int(hash_match.group(2))
+        else:
+            raise ValueError(f"Cannot parse PR reference {pr_ref!r} — use URL or owner/repo#number")
+
+        pr_result = subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--repo", repo,
+             "--json", "number,title,headRefName,baseRefName,url,updatedAt"],
+            capture_output=True, text=True,
+        )
+        if pr_result.returncode != 0:
+            raise RuntimeError(f"gh pr view failed: {pr_result.stderr}")
+        pr = json.loads(pr_result.stdout)
+
+        if since:
+            from datetime import datetime, timezone
+            updated_at = datetime.fromisoformat(pr["updatedAt"].replace("Z", "+00:00"))
+            since_dt = datetime.fromisoformat(since)
+            if since_dt.tzinfo is None:
+                since_dt = since_dt.replace(tzinfo=timezone.utc)
+            if updated_at <= since_dt:
+                log.info("PR #%d not updated since %s — skipping", pr_number, since)
+                return None
+
+        inline_result = subprocess.run(
+            ["gh", "api", f"repos/{repo}/pulls/{pr_number}/comments",
+             "--jq", "[.[] | {id:.id, path:.path, line:.line, body:.body, user:.user.login}]"],
+            capture_output=True, text=True,
+        )
+        inline = json.loads(inline_result.stdout) if inline_result.returncode == 0 and inline_result.stdout.strip() else []
+
+        issue_result = subprocess.run(
+            ["gh", "api", f"repos/{repo}/issues/{pr_number}/comments",
+             "--jq", "[.[] | {id:.id, body:.body, user:.user.login}]"],
+            capture_output=True, text=True,
+        )
+        issue = json.loads(issue_result.stdout) if issue_result.returncode == 0 and issue_result.stdout.strip() else []
+
+        if not inline and not issue:
+            log.info("No review comments on PR #%d — skipping", pr_number)
+            return None
+
+        comments_md = ""
+        reviewers: set[str] = set()
+        if inline:
+            comments_md += "### Inline review comments\n\n"
+            for c in inline:
+                comments_md += f"**@{c['user']}** on `{c['path']}` line {c.get('line', '?')}:\n> {c['body']}\n\n"
+                reviewers.add(c["user"])
+        if issue:
+            comments_md += "### General PR comments\n\n"
+            for c in issue:
+                comments_md += f"**@{c['user']}**:\n> {c['body']}\n\n"
+                reviewers.add(c["user"])
+
+        # Reviewers to re-request after pushing (exclude the escalation user —
+        # they need to respond to a question, not re-review finished work)
+        rerequest_users = sorted(reviewers - {escalation_user} if escalation_user else reviewers)
+        rerequest_md = ""
+        if rerequest_users:
+            rerequest_md = (
+                f"\n## After pushing — re-request review\n\n"
+                f"Once the PR Submitter has pushed the fix, re-request review from the "
+                f"reviewers whose comments you addressed. Check each user's type first — "
+                f"skip users whose `gh api users/<login> --jq '.type'` returns `\"Bot\"` "
+                f"if re-triggering a bot review is undesirable; otherwise include them.\n\n"
+                f"```bash\n"
+                + "".join(
+                    f"gh pr edit {pr_number} --repo {repo} --request-review {u}\n"
+                    for u in rerequest_users
+                )
+                + f"```\n"
+                f"This notifies reviewers that their comments have been addressed.\n"
+            )
+
+        escalation_md = ""
+        if escalation_user:
+            escalation_md = (
+                f"\n## Escalation\n\n"
+                f"If you are unsure how to address a comment or it requires a design decision, "
+                f"do NOT guess — post a reply tagging @{escalation_user}:\n\n"
+                f"```bash\n"
+                f"gh api repos/{repo}/issues/{pr_number}/comments \\\n"
+                f"  -X POST \\\n"
+                f'  -f body="@{escalation_user} Need your input: <brief summary>"\n'
+                f"```\n"
+            )
+
+        repo_name = repo.split("/")[-1]
+        work_id = f"REVIEW-PR{pr_number}"
+        spec = (
+            f"---\nwork_id: {work_id}\n"
+            f"title: \"Address review comments on PR #{pr_number}: {pr['title']}\"\n"
+            f"skip_deploy: true\n---\n\n"
+            f"# Address review comments on PR #{pr_number}\n\n"
+            f"**PR**: [{pr['title']}]({pr['url']})\n"
+            f"**Repository**: `{repo}`\n"
+            f"**Branch**: `{pr['headRefName']}` → `{pr['baseRefName']}`\n\n"
+            f"## Your task\n\n"
+            f"Review and address the open comments on this PR. For each comment:\n"
+            f"- If you can confidently address it with a targeted code change: do so\n"
+            f"- If you are unsure or it requires a design decision: escalate (see below)\n\n"
+            f"## Steps\n\n"
+            f"1. Clone the repository if not already present at `/workspace/{repo_name}` "
+            f"(or `git fetch` if already cloned)\n"
+            f"2. Add the fork remote and check out the PR branch: `git checkout {pr['headRefName']}`\n"
+            f"3. Read `CLAUDE.md` for repo-specific conventions and required checks\n"
+            f"4. Address each comment below\n"
+            f"5. Run `make pre-push` to validate all checks pass\n"
+            f"6. Leave changes uncommitted — Committer and PR Submitter handle that\n\n"
+            f"## Review comments\n\n{comments_md}"
+            f"{escalation_md}"
+            f"{rerequest_md}\n"
+            f"## Done when\n\n"
+            f"All addressable comments have code changes, comments needing human input "
+            f"have escalation replies, review has been re-requested from addressed reviewers, "
+            f"and `make pre-push` passes.\n\n"
+            f"Respond with 'Implementation complete.' when done.\n"
+        )
+
+        from spec_to_pr.models.work_item import SourceType
+        work_item = WorkItem(
+            work_id=work_id,
+            source_type=SourceType.REVIEW,
+            source_ref=pr_ref,
+            spec_content=spec,
+            title=f"Address review comments on PR #{pr_number}",
+        )
+        self.config.skip_deploy = True
+        return self.run(work_item)
+
     def resume(self, work_id: str) -> OrchestratorSession:
         session = self.storage.load_session(work_id)
         if session is None:
@@ -636,34 +781,33 @@ Keep the reason brief (one sentence)."""
             f"## Repositories to publish\n\n"
             f"{chr(10).join(repos_info)}\n\n"
             f"For each repository, follow this decision tree exactly.\n\n"
-            f"### Step 1 — understand the branch topology\n"
-            f"- `git remote -v` — identify all remotes. Note which URL belongs to `rrp-bot` (our bot's fork).\n"
-            f"- `git log --not --remotes --oneline` — commits that exist locally but not on any remote yet.\n"
-            f"- Find the divergence point (parent of the oldest local-only commit):\n"
-            f"  `git log --not --remotes --format='%P' | tail -1`\n"
-            f"- Find which remote branch contains that divergence point:\n"
-            f"  `git branch -r --contains <divergence-sha>`\n"
-            f"  This is the **source branch** — the branch these commits were built on top of.\n"
-            f"- Note the owner of the source branch's remote (e.g. `rrp-bot`, `openshift-online`, or a third party).\n\n"
+            f"### Step 1 — identify remotes and branch topology\n"
+            f"- Establish your identity: `BOT_OWNER=$(gh api user --jq '.login')`\n"
+            f"- `git remote -v` — list all remotes with their URLs.\n"
+            f"- The **bot fork** is the remote whose URL contains `${{BOT_OWNER}}/` as the owner.\n"
+            f"- The **upstream** is any other remote (the canonical org repo).\n"
+            f"- `git log --not --remotes --oneline` — commits that exist locally but not on any remote.\n"
+            f"- Find the divergence point: `git log --not --remotes --format='%P' | tail -1`\n"
+            f"- Find the source branch: `git branch -r --contains <divergence-sha>`\n"
+            f"  This is the branch these commits were built on top of.\n\n"
             f"### Step 2 — push and decide on a PR\n\n"
-            f"**Case A — source branch is on our fork (`rrp-bot`)**\n"
-            f"e.g. `origin/psav/vpc_move-rebased` where origin = `rrp-bot/...`\n"
-            f"- Push the new commits back to that same branch on the rrp-bot fork via `gh api` PATCH.\n"
+            f"**Never push directly to `main` or any default branch** — always push to a named branch.\n\n"
+            f"**Case A — source branch is on our bot fork**\n"
+            f"- Push back to that same branch on the bot fork: `git push <bot-remote> HEAD:<source-branch-name> --force`\n"
             f"- Check for an existing open PR: "
-            f"`gh pr list --repo <upstream> --head rrp-bot:<source-branch-name> --state open --json number,url`\n"
-            f"- If PR exists: report its URL. **Do NOT open a new PR.** The push already updated it.\n"
-            f"- If no PR: open one against the upstream default branch.\n\n"
-            f"**Case B — source branch is on a third-party fork (not `rrp-bot`, not upstream)**\n"
-            f"e.g. the branch lives on `someone-else/repo` — we do not own that fork.\n"
-            f"- Push our fix as a new branch to the **rrp-bot fork** via `gh api` POST.\n"
-            f"- Open a PR from `rrp-bot:<our-branch>` → `<third-party-owner>:<source-branch-name>`\n"
-            f"  on the upstream repo. This contributes the fix to their PR, not to main.\n"
-            f"  Do NOT target main — that would claim their work.\n\n"
-            f"**Case C — source branch is on upstream (e.g. `upstream/main`) or unknown**\n"
-            f"- Push as a new branch to the rrp-bot fork via `gh api` POST.\n"
-            f"- Open a PR against the upstream default branch.\n\n"
+            f"`gh pr list --repo <upstream> --head <bot-owner>:<source-branch-name> --state open --json number,url`\n"
+            f"- If PR exists: report its URL. **Do NOT open a new PR.**\n"
+            f"- If no PR: open one against the upstream non-default base branch (or `main` for standalone work).\n\n"
+            f"**Case B — source branch is on a third-party fork (not our bot, not upstream)**\n"
+            f"- Push our fix as a new branch to the bot fork: `git push <bot-remote> HEAD:<branch-name> --force`\n"
+            f"- Open a PR from `<bot-owner>:<branch-name>` → `<third-party-owner>:<source-branch-name>`\n"
+            f"  on the upstream repo. Contribute to their PR, not to main.\n"
+            f"  **Do NOT target main** — that would claim their work.\n\n"
+            f"**Case C — source branch is upstream main or standalone new feature**\n"
+            f"- Push to the bot fork: `git push <bot-remote> HEAD:<branch-name> --force`\n"
+            f"- Open a PR from `<bot-owner>:<branch-name>` → `main` on the upstream.\n\n"
             f"### Step 3 — PR content (when opening a new PR)\n"
-            f"`gh pr create --repo <upstream> --head <fork-owner>:<branch> --base <base> --title '...' --body '...'`\n"
+            f"`gh pr create --repo <upstream> --head <bot-owner>:<branch> --base <base> --title '...' --body '...'`\n"
             f"Body: what problem was solved, key files changed, "
             f"work ID ({session.work_item.work_id}), 'Generated by spec-to-pr'\n\n"
             f"After handling each repo, report the PR URL as:\n"
