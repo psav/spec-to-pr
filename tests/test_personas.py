@@ -26,7 +26,6 @@ DEVELOPER_AGENT = textwrap.dedent("""\
         type: enabled
         budget_tokens: 10000
     ---
-    Developer persona body text.
 """)
 
 
@@ -56,7 +55,8 @@ def test_persona_system_prompt(tmp_path):
     loader = PersonaLoader(agents_path=tmp_path)
     persona = loader.load("developer")
     prompt = persona.build_system_prompt()
-    assert "developer" in prompt
+    # No body in the fixture → structured prompt is built from frontmatter fields
+    assert "developer" in prompt.lower()
     assert "Implements features" in prompt
     assert "Do not merge PRs" in prompt
 
@@ -69,4 +69,4 @@ def test_persona_to_sdk_options(tmp_path):
     assert options["model"] == "claude-sonnet-4-6"
     assert options["max_turns"] == 100
     assert "system" in options
-    assert "developer" in options["system"]
+    assert "developer" in options["system"].lower()

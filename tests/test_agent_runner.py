@@ -25,8 +25,8 @@ def _mock_message_response(content_text: str, stop_reason: str = "end_turn"):
     return mock_response
 
 
-def test_save_conversation_method(tmp_path):
-    """Test the _save_conversation method directly without API calls."""
+def test_open_conversation_log(tmp_path):
+    """Test the _open_conversation_log method writes metadata and returns a file handle."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
 
@@ -38,28 +38,25 @@ def test_save_conversation_method(tmp_path):
         conversations_dir=conversations_dir,
     )
 
-    # Call _save_conversation directly
     work_id = "DIRECT-TEST"
     system_prompt = "Test prompt"
-    messages = [
-        {"role": "user", "content": "Hello"},
-        {"role": "assistant", "content": "Hi there"},
-    ]
-    final_text = "Done"
 
-    runner._save_conversation(work_id, system_prompt, messages, final_text)
+    conv_file = runner._open_conversation_log(work_id, system_prompt)
+    assert conv_file is not None
+    conv_file.close()
 
     # Verify file created
     files = list(conversations_dir.glob(f"{work_id}_*.jsonl"))
     assert len(files) == 1
 
-    # Verify content
+    # Verify metadata header was written
     lines = files[0].read_text().strip().split('\n')
-    assert len(lines) == 4  # metadata + 2 messages + result
+    assert len(lines) == 1  # just the metadata line
 
     metadata = json.loads(lines[0])
     assert metadata["work_id"] == work_id
     assert metadata["system_prompt"] == system_prompt
+    assert metadata["type"] == "metadata"
 
 
 def test_read_tool(tmp_path):
