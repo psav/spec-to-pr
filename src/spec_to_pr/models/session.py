@@ -48,6 +48,7 @@ class OrchestratorSession:
     repos: list[RepoState]
     created_at: datetime
     updated_at: datetime
+    deployment_params: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def new(cls, work_item: WorkItem, dry_run: bool = False, max_attempts: int = 3) -> OrchestratorSession:

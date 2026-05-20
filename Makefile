@@ -14,16 +14,15 @@ ephemeral-e2e:
 
 # Container build with proxy CA cert
 build:
-	@echo "Copying proxy CA cert into build context..."
-	@if [ -f /etc/pki/ca-trust/source/anchors/proxy-ca.crt ]; then \
-		cp /etc/pki/ca-trust/source/anchors/proxy-ca.crt .; \
-	else \
-		echo "Warning: proxy CA cert not found, creating dummy cert"; \
-		touch proxy-ca.crt; \
-	fi
 	@echo "Building container..."
-	podman build -t spec-to-pr:latest -f Containerfile .
-	@rm -f proxy-ca.crt
+	@if [ -f /etc/pki/ca-trust/source/anchors/proxy-ca.crt ]; then \
+		echo "Found proxy CA cert, passing as build arg..."; \
+		podman build -t spec-to-pr:latest -f Containerfile \
+			--build-arg PROXY_CA_CERT="$$(cat /etc/pki/ca-trust/source/anchors/proxy-ca.crt)" .; \
+	else \
+		echo "No proxy CA cert found, building without it..."; \
+		podman build -t spec-to-pr:latest -f Containerfile .; \
+	fi
 
 # Run tests
 test:

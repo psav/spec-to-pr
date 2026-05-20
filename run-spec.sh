@@ -16,12 +16,17 @@ set -euo pipefail
 SUBCOMMAND="${1:-}"
 
 _common_args() {
-  podman run --rm \
+  # Default SSL cert path to system bundle if not already set
+  local ca_bundle="${REQUESTS_CA_BUNDLE:-${SSL_CERT_FILE:-/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem}}"
+
+  podman run --rm --privileged \
     -v "${WORKSPACE_ROOT}":/workspace:z \
     -v "${SPEC_TO_PR_DATA}":/spec-to-pr-data:z \
-    -v ~/.aws/credentials:/root/.aws/credentials:ro,z \
+    -v ~/.aws:/root/.aws:ro,z \
     -e "GITHUB_TOKEN=${GITHUB_TOKEN}" \
     -e "AWS_PROFILE=${AWS_PROFILE:-rrp-central}" \
+    -e "AWS_CONFIG_FILE=${AWS_CONFIG_FILE:-/root/.aws/config}" \
+    -e "RRP_AWS_PROFILES_PRESET=1" \
     -e "ANTHROPIC_VERTEX_PROJECT_ID=${ANTHROPIC_VERTEX_PROJECT_ID}" \
     -e "CLOUD_ML_REGION=${CLOUD_ML_REGION}" \
     -e "CLAUDE_CODE_USE_VERTEX=${CLAUDE_CODE_USE_VERTEX}" \
@@ -30,7 +35,11 @@ _common_args() {
     -e "HTTP_PROXY=${HTTP_PROXY}" \
     -e "https_proxy=${https_proxy}" \
     -e "http_proxy=${http_proxy}" \
-    -e "AWS_CA_BUNDLE=${AWS_CA_BUNDLE:-}" \
+    -e "AWS_CA_BUNDLE=${AWS_CA_BUNDLE:-$ca_bundle}" \
+    -e "REQUESTS_CA_BUNDLE=$ca_bundle" \
+    -e "SSL_CERT_FILE=$ca_bundle" \
+    -e "CURL_CA_BUNDLE=$ca_bundle" \
+    -e "UV_NATIVE_TLS=${UV_NATIVE_TLS:-}" \
     -e "REVIEW_ESCALATION_USER=${REVIEW_ESCALATION_USER:-psav}" \
     "$@"
 }

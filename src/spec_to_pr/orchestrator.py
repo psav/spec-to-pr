@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import re
 import subprocess
 import sys
+import yaml
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -263,6 +266,26 @@ class Orchestrator:
         answer = input("Approve and continue? [y/N] ").strip().lower()
         self.state_machine.transition(session, human_approved=(answer == "y"))
 
+    def _load_deployment_params(self, session: OrchestratorSession) -> None:
+        """Load deployment parameters written by developer agent."""
+        cwd = Path(session.repos[0].workspace_path) if session.repos else self.config.workspace
+        params_file = cwd / ".spec-to-pr" / "deployment-params.yaml"
+
+        if not params_file.exists():
+            log.info("No deployment-params.yaml found - will use default deployment")
+            return
+
+        try:
+            with open(params_file) as f:
+                params = yaml.safe_load(f)
+            if params and isinstance(params, dict):
+                session.deployment_params = {k: str(v) for k, v in params.items()}
+                log.info("Loaded deployment params from developer agent: %s", session.deployment_params)
+            else:
+                log.warning("deployment-params.yaml exists but is empty or invalid")
+        except Exception as exc:
+            log.warning("Failed to load deployment-params.yaml: %s", exc)
+
     def _run_implementation_team(self, session: OrchestratorSession) -> None:
         """Spawn Claude SDK agent sessions for implementation work."""
         log.info("Running implementation team (attempt %d)", session.attempt_number)
@@ -271,6 +294,9 @@ class Orchestrator:
 
             # Commit changes and track them for PR creation
             self._commit_and_track_changes(session)
+
+            # Load deployment parameters if developer agent provided them
+            self._load_deployment_params(session)
 
             if self.config.skip_deploy:
                 log.info("skip_deploy=True — jumping straight to PR submission")
@@ -299,15 +325,37 @@ class Orchestrator:
             return
         log.info("Deploying to ephemeral environment")
         cwd = Path(session.repos[0].workspace_path) if session.repos else self.config.workspace
+
+        # Use deployment parameters specified by developer agent
+        make_vars = session.deployment_params
+        if make_vars:
+            log.info("Using deployment params from developer agent: %s", make_vars)
+
         log.info("Running make ephemeral-provision in %s", cwd)
-        ok = self._run_make("ephemeral-provision", cwd=cwd)
+        ok, stderr = self._run_make("ephemeral-provision", cwd=cwd, make_vars=make_vars)
+
         if not ok:
-            self._context_log_append(
-                session,
-                f"Deployment FAILED — attempt {session.attempt_number}",
-                f"- `make ephemeral-provision` failed in `{cwd}`\n"
-                f"- Entering debug phase",
-            )
+            error_class = self._classify_deployment_error(stderr)
+
+            if error_class == "infrastructure":
+                log.error("Infrastructure error detected - escalating to human immediately")
+                self._context_log_append(
+                    session,
+                    f"Deployment FAILED (infrastructure error) — attempt {session.attempt_number}",
+                    f"- `make ephemeral-provision` failed with infrastructure error\n"
+                    f"- Error: {stderr[-500:]}\n"
+                    f"- This is not a code issue that debug can fix - escalating to human",
+                )
+                session.current_phase = Phase.HUMAN_ESCALATION
+                return
+            else:
+                self._context_log_append(
+                    session,
+                    f"Deployment FAILED — attempt {session.attempt_number}",
+                    f"- `make ephemeral-provision` failed in `{cwd}`\n"
+                    f"- Entering debug phase",
+                )
+
         self.state_machine.transition(session, deployment_successful=ok)
 
     def _run_e2e(self, session: OrchestratorSession) -> None:
@@ -650,17 +698,62 @@ Keep the reason brief (one sentence)."""
             log.warning("Failed to infer test requirement: %s, defaulting to run tests", exc)
             return True
 
-    def _run_make(self, target: str, cwd: Path | None = None) -> bool:
+    def _classify_deployment_error(self, stderr: str) -> str:
+        """Classify deployment failure to determine if debug phase is useful.
+
+        Returns:
+            'infrastructure' - git/AWS/network errors that debug can't fix
+            'code' - errors in terraform/code that debug might fix
+            'unknown' - unclear, let debug investigate
+        """
+        infrastructure_patterns = [
+            r"Remote branch .* not found",
+            r"fatal: repository .* not found",
+            r"fatal: could not read Username",
+            r"The security token included in the request is invalid",
+            r"InvalidClientTokenId",
+            r"CredentialsError",
+            r"NoCredentialsError",
+            r"Unable to locate credentials",
+            r"Connection refused",
+            r"Name or service not known",
+            r"invalid peer certificate",
+        ]
+
+        for pattern in infrastructure_patterns:
+            if re.search(pattern, stderr, re.IGNORECASE):
+                return "infrastructure"
+
+        return "unknown"
+
+    def _run_make(self, target: str, cwd: Path | None = None, make_vars: dict[str, str] | None = None) -> tuple[bool, str]:
+        """Run make target with optional variables. Returns (success, stderr)."""
         run_cwd = cwd or self.config.workspace
+        # Ensure SSL/cert environment variables are passed through for proxy environments
+        env = os.environ.copy()
+        if "AWS_CA_BUNDLE" not in env and os.path.exists("/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"):
+            env["AWS_CA_BUNDLE"] = "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+        if "REQUESTS_CA_BUNDLE" not in env:
+            env["REQUESTS_CA_BUNDLE"] = env.get("AWS_CA_BUNDLE", "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem")
+        if "SSL_CERT_FILE" not in env:
+            env["SSL_CERT_FILE"] = env.get("REQUESTS_CA_BUNDLE", "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem")
+        if "UV_SYSTEM_CERTS" not in env:
+            env["UV_SYSTEM_CERTS"] = "1"
+
+        cmd = ["make", target]
+        if make_vars:
+            cmd.extend(f"{k}={v}" for k, v in make_vars.items())
+
         result = subprocess.run(
-            ["make", target],
+            cmd,
             capture_output=True,
             text=True,
             cwd=run_cwd,
+            env=env,
         )
         if result.returncode != 0:
             log.error("make %s failed (in %s):\n%s", target, run_cwd, result.stderr[-2000:])
-        return result.returncode == 0
+        return result.returncode == 0, result.stderr
 
     def _make_runner(self, persona_name: str, session: OrchestratorSession | None = None) -> tuple[AgentRunner, str]:
         """Return an AgentRunner configured with the given persona's SDK settings."""

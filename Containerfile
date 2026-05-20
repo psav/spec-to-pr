@@ -2,11 +2,15 @@ FROM registry.access.redhat.com/ubi9/python-311:latest
 
 USER 0
 
-# Install proxy CA cert if present in build context (for agent VM environment)
-COPY proxy-ca.crt /etc/pki/ca-trust/source/anchors/proxy-ca.crt
-RUN update-ca-trust
+# Optionally install a proxy CA cert at build time (e.g. egress proxy environments).
+# Pass the PEM content via: --build-arg PROXY_CA_CERT="$(cat /path/to/ca.crt)"
+ARG PROXY_CA_CERT=""
+RUN if [ -n "${PROXY_CA_CERT}" ]; then \
+        echo "${PROXY_CA_CERT}" > /etc/pki/ca-trust/source/anchors/proxy-ca.crt && \
+        update-ca-trust; \
+    fi
 
-RUN dnf install -y git make tar && \
+RUN dnf install -y git make tar jq podman && \
     curl -fsSL https://cli.github.com/packages/rpm/gh-cli.repo \
         -o /etc/yum.repos.d/github-cli.repo && \
     dnf install -y gh && \
@@ -21,7 +25,12 @@ WORKDIR /workspace
 
 COPY . /opt/spec-to-pr/
 
-RUN uv pip install --python python3.11 --system-certs --system /opt/spec-to-pr/
+ARG PROXY_CA_CERT
+RUN if [ -n "${PROXY_CA_CERT}" ]; then \
+        uv pip install --python python3.11 --native-tls --system /opt/spec-to-pr/; \
+    else \
+        uv pip install --python python3.11 --system-certs --system /opt/spec-to-pr/; \
+    fi
 
 # Configure git identity for commits
 RUN git config --system user.name "spec-to-pr-bot" && \

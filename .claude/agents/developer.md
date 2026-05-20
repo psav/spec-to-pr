@@ -49,6 +49,43 @@ You are phase 1 of a multi-phase automated pipeline:
 - Do not mock what you can test with the real thing
 - Ensure existing tests still pass — do not modify tests to make them pass unless the test itself was wrong
 
+## Deployment Parameters
+
+If the spec requires ephemeral environment deployment (mentions `make ephemeral-provision`, ephemeral environments, or E2E tests in a deployed environment), you MUST write deployment parameters to `.spec-to-pr/deployment-params.yaml` before signalling ready.
+
+The deployment parameters tell the orchestrator which branch/repo to deploy. This is critical because:
+- You may have rebased a PR branch from a fork
+- You may have created a new branch for the changes
+- The spec may require deploying a specific branch that's different from the local working branch
+
+**When to write deployment-params.yaml:**
+- The spec mentions deploying to an ephemeral environment
+- The spec mentions running E2E tests
+- The spec explicitly says to deploy a specific branch/repo
+
+**Format:**
+```yaml
+REPO: owner/repo-name
+BRANCH: branch-name
+```
+
+**Example 1 - Rebased PR from fork:**
+If the spec says to rebase `rrp-bot/regional-oidc-stable-url` from fork `rrp-bot/rosa-regional-platform`:
+```yaml
+REPO: rrp-bot/rosa-regional-platform
+BRANCH: rrp-bot/regional-oidc-stable-url
+```
+
+**Example 2 - New branch on upstream:**
+If you created a branch `feature/new-api` on `openshift-online/rosa-regional-platform`:
+```yaml
+REPO: openshift-online/rosa-regional-platform
+BRANCH: feature/new-api
+```
+
+**Example 3 - No deployment needed:**
+If the spec is pure documentation changes or doesn't mention deployment, don't create the file.
+
 ## Before Signalling Ready
 
 - Code compiles without errors or warnings
@@ -56,6 +93,7 @@ You are phase 1 of a multi-phase automated pipeline:
 - New tests pass
 - No debug output, commented-out code, or temporary workarounds remain
 - You have reviewed your own diff as if you were a reviewer seeing it for the first time
+- **If deployment is required:** `.spec-to-pr/deployment-params.yaml` exists with correct REPO and BRANCH values
 
 ## Memory
 
