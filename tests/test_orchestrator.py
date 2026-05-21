@@ -23,7 +23,7 @@ def _work_item(text="Add health check endpoint") -> WorkItem:
     return WorkItem.from_inline(text)
 
 
-def _make_ok():
+def _run_ok():
     m = MagicMock()
     m.returncode = 0
     m.stdout = "ok"
@@ -31,17 +31,33 @@ def _make_ok():
     return m
 
 
-def _make_fail():
+def _popen_ok():
     m = MagicMock()
-    m.returncode = 1
-    m.stdout = ""
-    m.stderr = "make failed"
+    m.stdout = iter([])
+    m.stderr = iter([])
+    m.returncode = 0
+    m.wait.return_value = 0
     return m
 
 
+def _popen_fail():
+    m = MagicMock()
+    m.stdout = iter([])
+    m.stderr = iter(["make failed\n"])
+    m.returncode = 1
+    m.wait.return_value = 1
+    return m
+
+
+# _run_make now uses Popen; all other subprocess calls (git, gh) use subprocess.run.
+# Tests that exercise make targets need both mocks.
+_popen_always_ok = lambda *a, **kw: _popen_ok()  # noqa: E731
+
+
 @patch("spec_to_pr.agent_runner.AgentRunner.run", return_value="Implementation complete.")
-@patch("spec_to_pr.orchestrator.subprocess.run", return_value=_make_ok())
-def test_happy_path_complete(mock_make, mock_agent, tmp_path):
+@patch("spec_to_pr.orchestrator.subprocess.Popen", side_effect=_popen_always_ok)
+@patch("spec_to_pr.orchestrator.subprocess.run", return_value=_run_ok())
+def test_happy_path_complete(mock_run, mock_popen, mock_agent, tmp_path):
     """Spec → Implementation → Deploy → E2E pass → PR → Complete."""
     config = _config(tmp_path)
     session = Orchestrator(config).run(_work_item())
@@ -49,44 +65,46 @@ def test_happy_path_complete(mock_make, mock_agent, tmp_path):
 
 
 @patch("spec_to_pr.agent_runner.AgentRunner.run", return_value="Implementation complete.")
-@patch("spec_to_pr.orchestrator.subprocess.run", return_value=_make_ok())
-def test_dry_run_aborts(mock_make, mock_agent, tmp_path):
+@patch("spec_to_pr.orchestrator.subprocess.run", return_value=_run_ok())
+def test_dry_run_aborts(mock_run, mock_agent, tmp_path):
     with patch("builtins.input", return_value="n"):
         session = Orchestrator(_config(tmp_path)).run(_work_item(), dry_run=True)
     assert session.current_phase == Phase.ABORTED
 
 
 @patch("spec_to_pr.agent_runner.AgentRunner.run", return_value="Implementation complete.")
-@patch("spec_to_pr.orchestrator.subprocess.run", return_value=_make_ok())
-def test_dry_run_continues_on_approval(mock_make, mock_agent, tmp_path):
+@patch("spec_to_pr.orchestrator.subprocess.Popen", side_effect=_popen_always_ok)
+@patch("spec_to_pr.orchestrator.subprocess.run", return_value=_run_ok())
+def test_dry_run_continues_on_approval(mock_run, mock_popen, mock_agent, tmp_path):
     with patch("builtins.input", return_value="y"):
         session = Orchestrator(_config(tmp_path)).run(_work_item(), dry_run=True)
     assert session.current_phase == Phase.COMPLETE
 
 
 @patch("spec_to_pr.agent_runner.AgentRunner.run", return_value="Implementation complete.")
-@patch("spec_to_pr.orchestrator.subprocess.run", return_value=_make_ok())
-def test_skip_deploy_goes_straight_to_complete(mock_make, mock_agent, tmp_path):
+@patch("spec_to_pr.orchestrator.subprocess.run", return_value=_run_ok())
+def test_skip_deploy_goes_straight_to_complete(mock_run, mock_agent, tmp_path):
     config = _config(tmp_path)
     config.skip_deploy = True
     session = Orchestrator(config).run(_work_item())
     assert session.current_phase == Phase.COMPLETE
-    # make should never have been called for ephemeral targets
-    make_targets = [c.args[0][1] for c in mock_make.call_args_list if c.args]
+    # Popen (make) should never have been called
+    make_targets = [c.args[0][1] for c in mock_run.call_args_list if c.args and c.args[0][0] == "make"]
     assert "ephemeral-dev" not in make_targets
 
 
 @patch("spec_to_pr.agent_runner.AgentRunner.run", return_value="- pod OOMKilled\n- memory limit too low")
-@patch("spec_to_pr.orchestrator.subprocess.run")
-def test_e2e_failure_trips_circuit_breaker(mock_make, mock_agent, tmp_path):
+@patch("spec_to_pr.orchestrator.subprocess.Popen")
+@patch("spec_to_pr.orchestrator.subprocess.run", return_value=_run_ok())
+def test_e2e_failure_trips_circuit_breaker(mock_run, mock_popen, mock_agent, tmp_path):
     """E2E failures cycle through debug→circuit_breaker until escalation."""
-    def make_side_effect(*args, **kwargs):
+    def popen_side_effect(*args, **kwargs):
         cmd = args[0] if args else []
-        if "e2e" in " ".join(cmd):
-            return _make_fail()
-        return _make_ok()
+        if "ephemeral-e2e" in " ".join(str(x) for x in cmd):
+            return _popen_fail()
+        return _popen_ok()
 
-    mock_make.side_effect = make_side_effect
+    mock_popen.side_effect = popen_side_effect
     config = _config(tmp_path)
     config.max_attempts = 2
     session = Orchestrator(config).run(_work_item())
@@ -94,8 +112,9 @@ def test_e2e_failure_trips_circuit_breaker(mock_make, mock_agent, tmp_path):
 
 
 @patch("spec_to_pr.agent_runner.AgentRunner.run", return_value="Implementation complete.")
-@patch("spec_to_pr.orchestrator.subprocess.run", return_value=_make_ok())
-def test_resume_loads_and_continues(mock_make, mock_agent, tmp_path):
+@patch("spec_to_pr.orchestrator.subprocess.Popen", side_effect=_popen_always_ok)
+@patch("spec_to_pr.orchestrator.subprocess.run", return_value=_run_ok())
+def test_resume_loads_and_continues(mock_run, mock_popen, mock_agent, tmp_path):
     config = _config(tmp_path)
     orch = Orchestrator(config)
     wi = _work_item()
@@ -116,7 +135,7 @@ def test_implementation_failure_trips_circuit_breaker(mock_agent, tmp_path):
 
 
 @patch("spec_to_pr.agent_runner.AgentRunner.run", return_value="Implementation complete.")
-@patch("spec_to_pr.orchestrator.subprocess.run", return_value=_make_ok())
+@patch("spec_to_pr.orchestrator.subprocess.run", return_value=_run_ok())
 def test_resume_honours_skip_deploy_from_spec_frontmatter(mock_make, mock_agent, tmp_path):
     """resume() must not call make ephemeral-provision when the stored spec has skip_deploy: true."""
     spec_with_skip = "---\nwork_id: TEST-SKIP\ntitle: Test\nskip_deploy: true\n---\n\nDo something."
