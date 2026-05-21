@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import yaml
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -292,11 +293,11 @@ class Orchestrator:
         try:
             self._run_claude_agent("developer", session)
 
-            # Commit changes and track them for PR creation
-            self._commit_and_track_changes(session)
-
             # Load deployment parameters if developer agent provided them
             self._load_deployment_params(session)
+
+            # Commit changes and track them for PR creation
+            self._commit_and_track_changes(session)
 
             if self.config.skip_deploy:
                 log.info("skip_deploy=True — jumping straight to PR submission")
@@ -331,6 +332,20 @@ class Orchestrator:
         if make_vars:
             log.info("Using deployment params from developer agent: %s", make_vars)
 
+        envs_file = cwd / ".ephemeral-envs"
+        if envs_file.exists():
+            in_progress = [
+                line for line in envs_file.read_text().splitlines()
+                if "STATE=provisioning" in line
+            ]
+            if in_progress:
+                log.warning(
+                    "Skipping ephemeral-provision — %d env(s) already provisioning: %s",
+                    len(in_progress), in_progress,
+                )
+                self.state_machine.transition(session, deployment_successful=True)
+                return
+
         log.info("Running make ephemeral-provision in %s", cwd)
         ok, stderr = self._run_make("ephemeral-provision", cwd=cwd, make_vars=make_vars)
 
@@ -361,7 +376,7 @@ class Orchestrator:
     def _run_e2e(self, session: OrchestratorSession) -> None:
         log.info("Running e2e tests")
         cwd = Path(session.repos[0].workspace_path) if session.repos else self.config.workspace
-        ok = self._run_make("ephemeral-e2e", cwd=cwd)
+        ok, _ = self._run_make("ephemeral-e2e", cwd=cwd)
         if not ok:
             self._context_log_append(
                 session,
@@ -443,7 +458,10 @@ class Orchestrator:
         from spec_to_pr.models.session import RepoState
         import re
 
-        branch_name = f"spec-to-pr/{session.work_item.work_id}"
+        branch_name = (
+            (session.deployment_params or {}).get("BRANCH")
+            or f"spec-to-pr/{session.work_item.work_id}"
+        )
 
         repos_with_work = self._find_repos_with_local_work()
         if not repos_with_work:
@@ -578,14 +596,22 @@ class Orchestrator:
             f"## Spec\n\n"
             f"{session.work_item.spec_content}\n\n"
             f"---\n\n"
-            f"*Agents: read this file before starting. Append a brief summary when done.*\n\n"
+            f"*Agents: read this file before starting. Most recent updates appear first, below this line.*\n\n"
         )
 
     def _context_log_append(self, session: OrchestratorSession, heading: str, body: str) -> None:
         path = self._context_log_path(session)
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        with open(path, "a") as f:
-            f.write(f"## {heading} — {now}\n\n{body.strip()}\n\n")
+        entry = f"## {heading} — {now}\n\n{body.strip()}\n\n"
+        existing = path.read_text() if path.exists() else ""
+        # Insert after the header marker so most-recent entries appear before older ones.
+        marker = "*Agents: read this file before starting. Most recent updates appear first, below this line.*\n\n"
+        if marker in existing:
+            idx = existing.index(marker) + len(marker)
+            path.write_text(existing[:idx] + entry + existing[idx:])
+        else:
+            with open(path, "a") as f:
+                f.write(entry)
 
     def _load_project_docs(self) -> None:
         """Load project documentation to provide environment and project context to agents."""
@@ -731,29 +757,62 @@ Keep the reason brief (one sentence)."""
         run_cwd = cwd or self.config.workspace
         # Ensure SSL/cert environment variables are passed through for proxy environments
         env = os.environ.copy()
-        if "AWS_CA_BUNDLE" not in env and os.path.exists("/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"):
-            env["AWS_CA_BUNDLE"] = "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+        _proxy_ca = "/etc/pki/ca-trust/source/anchors/proxy-ca.crt"
+        _system_ca = "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+        if "AWS_CA_BUNDLE" not in env and os.path.exists(_system_ca):
+            env["AWS_CA_BUNDLE"] = _system_ca
         if "REQUESTS_CA_BUNDLE" not in env:
-            env["REQUESTS_CA_BUNDLE"] = env.get("AWS_CA_BUNDLE", "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem")
+            env["REQUESTS_CA_BUNDLE"] = env.get("AWS_CA_BUNDLE", _system_ca)
         if "SSL_CERT_FILE" not in env:
-            env["SSL_CERT_FILE"] = env.get("REQUESTS_CA_BUNDLE", "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem")
+            env["SSL_CERT_FILE"] = env.get("REQUESTS_CA_BUNDLE", _system_ca)
         if "UV_SYSTEM_CERTS" not in env:
             env["UV_SYSTEM_CERTS"] = "1"
+        # Pass the egress proxy CA cert to container image builds (podman/docker build --build-arg).
+        # ensure_image() in env-common.sh checks PROXY_CA_CERT and passes it as a build arg so
+        # that dnf/apt inside the CI container can reach package registries through the proxy.
+        if "PROXY_CA_CERT" not in env and os.path.exists(_proxy_ca):
+            try:
+                env["PROXY_CA_CERT"] = Path(_proxy_ca).read_text()
+            except OSError:
+                pass
 
         cmd = ["make", target]
         if make_vars:
             cmd.extend(f"{k}={v}" for k, v in make_vars.items())
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            cwd=run_cwd,
-            env=env,
-        )
-        if result.returncode != 0:
-            log.error("make %s failed (in %s):\n%s", target, run_cwd, result.stderr[-2000:])
-        return result.returncode == 0, result.stderr
+        log_dir = run_cwd / ".spec-to-pr" / "make-logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        log_path = log_dir / f"{target}-{timestamp}.log"
+        log.info("make %s → streaming output to %s", target, log_path)
+
+        stderr_buf: list[str] = []
+        with open(log_path, "w") as lf:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, cwd=run_cwd, env=env,
+            )
+
+            def _drain(stream, collect: list[str] | None, tty) -> None:
+                for line in stream:
+                    lf.write(line)
+                    if collect is not None:
+                        collect.append(line)
+                    tty.write(line)
+                    tty.flush()
+
+            t_out = threading.Thread(target=_drain, args=(proc.stdout, None, sys.stdout), daemon=True)
+            t_err = threading.Thread(target=_drain, args=(proc.stderr, stderr_buf, sys.stderr), daemon=True)
+            t_out.start()
+            t_err.start()
+            proc.wait()
+            t_out.join()
+            t_err.join()
+
+        stderr = "".join(stderr_buf)
+        if proc.returncode != 0:
+            log.error("make %s failed (exit %d) — full log: %s", target, proc.returncode, log_path)
+        return proc.returncode == 0, stderr
 
     def _make_runner(self, persona_name: str, session: OrchestratorSession | None = None) -> tuple[AgentRunner, str]:
         """Return an AgentRunner configured with the given persona's SDK settings."""
@@ -834,7 +893,14 @@ Keep the reason brief (one sentence)."""
             f"Investigate logs, deployment state, and recent changes. Identify what failed "
             f"and why. Append your findings to `{ctx_path}` as a markdown section, "
             f"including the path to your conversation log. Then return a bullet-point list "
-            f"of findings and hypotheses followed by exactly: 'Debug complete.'"
+            f"of findings and hypotheses followed by exactly: 'Debug complete.'\n\n"
+            f"## Constraints\n"
+            f"- Do NOT run `make ephemeral-provision` — provisioning is the orchestrator's job on retry.\n"
+            f"- You MAY run `make ephemeral-resync ID=<id>` if an environment already exists and "
+            f"a code fix needs redeploying to verify it.\n"
+            f"- Do NOT start long-running blocking operations. Background any shell commands that "
+            f"take more than a few seconds.\n"
+            f"- Write findings and exit. The orchestrator will handle retrying the failed phase."
         )
         response = runner.run(
             system_prompt=system_prompt,

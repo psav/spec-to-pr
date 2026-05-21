@@ -34,6 +34,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--agents", default="/opt/spec-to-pr/.claude/agents", metavar="PATH")
     run_p.add_argument("--conversations", default="/spec-to-pr-data/conversations", metavar="PATH")
     run_p.add_argument("--project-docs", metavar="PATH", help="Path to CLAUDE.md or project docs (auto-discovers if not specified)")
+    run_p.add_argument("--workspace", metavar="PATH", help="Root workspace directory (default: current directory)")
 
     # ---- status ----
     status_p = sub.add_parser("status", help="Show session status for a work ID")
@@ -109,6 +110,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         project_docs_path=Path(args.project_docs) if args.project_docs else None,
         max_attempts=args.max_attempts,
         skip_deploy=skip_deploy,
+        workspace=Path(args.workspace) if args.workspace else Path.cwd(),
     )
     orch = Orchestrator(config)
     session = orch.run(work_item, dry_run=args.dry_run)

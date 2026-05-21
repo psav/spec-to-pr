@@ -23,6 +23,91 @@ make build         # Build container image
 ./run-spec.sh <spec.md>  # Run orchestrator in container
 ```
 
+## Direct CLI invocation (outside container)
+
+The container image uses `run-spec.sh` to set up mounts and env vars automatically.
+When running the CLI directly (e.g. during development or in an ECS agent VM), you must
+supply the equivalent flags yourself.
+
+### One-time setup
+
+```bash
+cd /workspace/spec-to-pr
+uv venv --python 3.11 .venv
+source .venv/bin/activate
+uv pip install -e ".[dev]"
+```
+
+### Running a spec
+
+Always run from `/workspace` (not from inside the `spec-to-pr` subdirectory) so the
+orchestrator's workspace scan finds cloned repos correctly. Pass all paths explicitly:
+
+```bash
+cd /workspace
+source /workspace/spec-to-pr/.venv/bin/activate
+
+spec-to-pr run \
+  --file /workspace/my-spec.md \
+  --storage ~/.spec-to-pr/sessions \
+  --conversations ~/.spec-to-pr/conversations \
+  --agents /workspace/spec-to-pr/.claude/agents \
+  --workspace /workspace \
+  --verbose
+```
+
+`--workspace` sets the root that the orchestrator scans for cloned repos and is the
+`cwd` for `make` targets. If omitted it defaults to `os.getcwd()` — running from
+the wrong directory silently breaks repo scanning and Makefile targets.
+
+### Common mistakes
+
+| Mistake | Symptom | Fix |
+|---|---|---|
+| Running from `/workspace/spec-to-pr` instead of `/workspace` | Developer agent can't find cloned repos; `make` targets fail | `cd /workspace` before invoking |
+| Missing `--agents` | "Persona not found — using defaults"; agent ignores all persona rules | Pass `--agents /workspace/spec-to-pr/.claude/agents` |
+| Missing `--storage` / `--conversations` | `FileNotFoundError` on `/spec-to-pr-data` (container path) | Pass `~/.spec-to-pr/sessions` and `~/.spec-to-pr/conversations` |
+| `ANTHROPIC_VERTEX_PROJECT_ID` not set | `AnthropicVertex` auth failure on first agent run | Export the var or add to shell profile |
+
+### Resume an interrupted session
+
+```bash
+spec-to-pr resume \
+  --work-id MY-WORK-ID \
+  --storage ~/.spec-to-pr/sessions \
+  --conversations ~/.spec-to-pr/conversations \
+  --agents /workspace/spec-to-pr/.claude/agents \
+  --verbose
+```
+
+### Generate a spec from plain English
+
+Use `spec-to-pr generate` to create a structured spec file from a plain-English task
+description. The generator agent uses `gh` CLI to research the repo before writing.
+
+```bash
+cd /workspace
+source /workspace/spec-to-pr/.venv/bin/activate
+
+spec-to-pr generate "Fix the OOMKilled pods in the regional OIDC service" \
+  --output /workspace/my-spec.md \
+  --agents /workspace/spec-to-pr/.claude/agents \
+  --conversations ~/.spec-to-pr/conversations
+```
+
+If `--output` is omitted the file is written to the current directory with an
+auto-slugged name (e.g. `fix-the-oomkilled-pods-in-the-regional.md`).
+
+The generated spec uses YAML frontmatter (`work_id`, `title`, optional `skip_deploy`)
+followed by a structured markdown body. Validate with `spec-to-pr validate --file <path>`
+before running.
+
+### Make output
+
+`make ephemeral-provision` and `make ephemeral-e2e` stream output to both the terminal
+and a timestamped log file at `<repo>/.spec-to-pr/make-logs/<target>-<timestamp>.log`.
+Provisions typically take 30-40 minutes; the orchestrator blocks for the duration.
+
 ## Project structure
 
 - `src/spec_to_pr/` — Python package (Python 3.11+)
