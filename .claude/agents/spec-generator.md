@@ -40,17 +40,20 @@ The verbatim task description as given by the user.
 Why this task exists, starting state, relevant background from your research
 (PR title, branch names, commits, what's drifted, what's failing, etc.).
 
-## Implementation guidance
-What the developer agent should accomplish — the goal and approach,
+## Implementation
+(Developer agent only) What the developer agent should accomplish — the goal and approach,
 not a prescriptive list of commands. Include suggestions where they add value
 (e.g. rebase vs merge, how to handle conflicts, what files to look at).
+The developer agent NEVER commits or pushes — it only makes changes on disk.
 
-## Committer notes
-What the committer agent should expect to find (e.g. "the rebase will leave
-unpushed commits but no uncommitted files — detect and report them").
+## Committer
+(Committer agent only) What the committer agent should expect to find
+(e.g. "the rebase will leave unpushed commits but no uncommitted files — detect and report them").
+Suggested commit message style.
 
-## PR Submitter notes
-Base branch, PR title suggestion, what to include in the PR description.
+## PR Submission
+(PR Submitter agent only) Base branch, PR title suggestion, what to include in the PR description,
+push strategy (force-push vs new branch), and any special targeting rules.
 
 ## Constraints
 What must NOT happen.

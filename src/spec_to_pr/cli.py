@@ -12,6 +12,40 @@ from spec_to_pr.orchestrator import Config, Orchestrator
 from spec_to_pr.storage import FileStorage
 
 
+def _cmd_visualise(argv: list[str]) -> None:
+    """Standalone TUI monitor: watch a running spec-to-pr session live."""
+    vp = argparse.ArgumentParser(
+        prog="spec-to-pr --visualise",
+        description="Real-time console visualiser for a running spec-to-pr session",
+    )
+    vp.add_argument("--visualise", action="store_true")
+    vp.add_argument(
+        "--storage",
+        default="/spec-to-pr-data/sessions",
+        metavar="PATH",
+        help="Session storage directory (same value passed to spec-to-pr run)",
+    )
+    vp.add_argument(
+        "--conversations",
+        default="/spec-to-pr-data/conversations",
+        metavar="PATH",
+        help="Conversations directory (same value passed to spec-to-pr run)",
+    )
+    vp.add_argument(
+        "--work-id",
+        metavar="ID",
+        help="Watch a specific work ID (default: most recently active session)",
+    )
+    args = vp.parse_args(argv)
+
+    from spec_to_pr.visualiser import Visualiser
+    Visualiser(
+        storage_dir=Path(args.storage),
+        conversations_dir=Path(args.conversations),
+        work_id=args.work_id,
+    ).run()
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="spec-to-pr",
@@ -35,6 +69,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--conversations", default="/spec-to-pr-data/conversations", metavar="PATH")
     run_p.add_argument("--project-docs", metavar="PATH", help="Path to CLAUDE.md or project docs (auto-discovers if not specified)")
     run_p.add_argument("--workspace", metavar="PATH", help="Root workspace directory (default: current directory)")
+    run_p.add_argument("--visualise", action="store_true", help="Launch live TUI alongside the run")
 
     # ---- status ----
     status_p = sub.add_parser("status", help="Show session status for a work ID")
@@ -89,6 +124,8 @@ def _configure_logging(verbose: bool) -> None:
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
+    import threading
+
     if args.work_id:
         work_item = WorkItem.from_jira(args.work_id)
         work_item.spec_content = f"JIRA ticket: {args.work_id}"
@@ -112,8 +149,45 @@ def _cmd_run(args: argparse.Namespace) -> int:
         skip_deploy=skip_deploy,
         workspace=Path(args.workspace) if args.workspace else Path.cwd(),
     )
-    orch = Orchestrator(config)
-    session = orch.run(work_item, dry_run=args.dry_run)
+
+    stop_event: threading.Event | None = None
+    vis_thread: threading.Thread | None = None
+    _orig_stdout = None
+    if getattr(args, "visualise", False):
+        from spec_to_pr.visualiser import Visualiser
+        stop_event = threading.Event()
+        # Redirect stdout and silence logging BEFORE starting the thread so
+        # the thread always sees /dev/null via sys.stdout and uses
+        # sys.__stdout__ (the real TTY) for the Console instead.
+        logging.disable(logging.CRITICAL)
+        _orig_stdout = sys.stdout
+        sys.stdout = open(os.devnull, "w")
+        vis = Visualiser(
+            storage_dir=Path(args.storage),
+            conversations_dir=Path(args.conversations),
+            work_id=work_item.work_id,
+        )
+        # Non-daemon so Python waits for Live.__exit__ to restore the terminal
+        # before the process ends.
+        vis_thread = threading.Thread(target=vis.run, kwargs={"stop_event": stop_event}, daemon=False)
+        vis_thread.start()
+
+    try:
+        orch = Orchestrator(config)
+        session = orch.run(work_item, dry_run=args.dry_run)
+    finally:
+        if stop_event:
+            stop_event.set()
+        if vis_thread:
+            vis_thread.join(timeout=5)  # wait for Live.__exit__ to restore terminal
+        if _orig_stdout:
+            try:
+                sys.stdout.close()
+            except Exception:
+                pass
+            sys.stdout = _orig_stdout
+            logging.disable(logging.NOTSET)
+
     print(f"\nFinal phase: {session.current_phase.value}")
     return 0 if session.current_phase.value == "complete" else 1
 
@@ -260,6 +334,13 @@ def _cmd_resume(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
+    # Standalone visualiser: only when --visualise is the first real argument
+    # (i.e. no subcommand precedes it). "spec-to-pr run --visualise" goes
+    # through normal subcommand dispatch instead.
+    if len(sys.argv) > 1 and sys.argv[1] == "--visualise":
+        _cmd_visualise(sys.argv[1:])
+        return
+
     parser = _build_parser()
     args = parser.parse_args()
     _configure_logging(args.verbose)

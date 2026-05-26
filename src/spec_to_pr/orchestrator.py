@@ -22,6 +22,12 @@ from spec_to_pr.models import (
     WorkItem,
 )
 from spec_to_pr.models.phase_context import DebugOutcome, EphemeralEnv, FailurePhase, PhaseContext
+from spec_to_pr.models.work_item import (
+    _COMMITTER_HEADINGS,
+    _PR_SUBMITTER_HEADINGS,
+    _spec_for_developer,
+    _spec_section,
+)
 from spec_to_pr.agent_runner import AgentRunner
 from spec_to_pr.personas import PersonaLoader
 from spec_to_pr.state_machine import StateMachine
@@ -299,6 +305,9 @@ class Orchestrator:
             # Commit changes and track them for PR creation
             self._commit_and_track_changes(session)
 
+            # Reload deployment params — committer may have updated them after pushing
+            self._load_deployment_params(session)
+
             if self.config.skip_deploy:
                 log.info("skip_deploy=True — jumping straight to PR submission")
                 session.current_phase = Phase.PR_SUBMISSION
@@ -489,6 +498,11 @@ class Orchestrator:
             )
 
             runner, system_prompt = self._make_runner("committer", session)
+            committer_notes = _spec_section(session.work_item.spec_content, _COMMITTER_HEADINGS)
+            notes_block = (
+                f"\n## Spec notes for this commit\n{committer_notes}\n"
+                if committer_notes else ""
+            )
             task = (
                 f"Work ID: {session.work_item.work_id}\n"
                 f"Branch: {branch_name}\n"
@@ -499,7 +513,7 @@ class Orchestrator:
                 f"   - If there ARE uncommitted changes: proceed to step 3.\n"
                 f"   - If there are NO uncommitted changes, the developer already committed. "
                 f"Run `git log --oneline --not --remotes` to confirm there are unpushed commits, "
-                f"then skip to step 6 and list those files.\n"
+                f"then skip straight to step 6 (push).\n"
                 f"3. Filter out spec-to-pr metadata — never stage:\n"
                 f"   - .spec-to-pr/ directory\n"
                 f"   - conversations/ directory\n"
@@ -509,8 +523,20 @@ class Orchestrator:
                 f"5. Stage only implementation files and commit:\n"
                 f"   [{session.work_item.work_id}] <brief description of what changed>\n\n"
                 f"   Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>\n"
-                f"6. Report committed files as:\n"
-                f"   Committed files: <file1>, <file2>, ...\n\n"
+                f"6. Push the branch to the bot fork so the ephemeral environment can clone it:\n"
+                f"   - Identify the bot remote: "
+                f"`BOT_OWNER=$(gh api user --jq '.login')` then find the remote whose URL "
+                f"contains `/${{BOT_OWNER}}/`.\n"
+                f"   - `git push <bot-remote> HEAD:{branch_name} --force`\n"
+                f"   - Report the push result (remote URL and branch).\n"
+                f"   - After a successful push, write `{repo_path}/.spec-to-pr/deployment-params.yaml` "
+                f"with exactly these two lines (substitute real values):\n"
+                f"     REPO: <bot-owner>/<repo-name>\n"
+                f"     BRANCH: {branch_name}\n"
+                f"     (repo-name is just the last path component of the remote URL, no .git suffix)\n"
+                f"7. Report committed files as:\n"
+                f"   Committed files: <file1>, <file2>, ...\n"
+                f"{notes_block}\n"
                 f"Respond with 'Commit complete.' when done."
             )
 
@@ -852,23 +878,24 @@ Keep the reason brief (one sentence)."""
             f"Work ID: {session.work_item.work_id}\n"
             f"Attempt: {session.attempt_number}\n\n"
             f"## Your phase: IMPLEMENTATION\n"
-            f"You are in phase 1 of the pipeline. Your job is to make code changes on disk only.\n"
-            f"Do NOT `git add`, `git commit`, create branches, `git push`, or open PRs.\n"
-            f"The Committer and PR Submitter agents handle those steps after you finish.\n"
-            f"If the spec contains 'Committer notes' or 'PR Submitter notes' sections, read them\n"
-            f"for context but do not act on them — those are instructions for later agents.\n\n"
+            f"You are in phase 1 of a multi-phase pipeline. Make the required code "
+            f"changes on disk, then signal completion.\n\n"
             f"## Context log\n"
             f"Read `{ctx_path}` first — it contains the spec, everything learned in "
             f"previous attempts, and pointers to prior conversation logs you can Read "
             f"for details.\n\n"
             f"## Your task\n"
-            f"{session.work_item.spec_content}\n\n"
+            f"{_spec_for_developer(session.work_item.spec_content)}\n\n"
             f"## When done\n"
             f"Stop calling tools once you have reached a conclusion. Append a brief "
             f"markdown section to `{ctx_path}` summarising: what you found, what you "
             f"changed (with file paths), and what still needs work. Include the path to "
             f"your conversation log if available. Then respond with a final summary "
-            f"followed by exactly: 'Implementation complete.'"
+            f"followed by exactly: 'Implementation complete.'\n\n"
+            f"## STOP — do not commit or push\n"
+            f"Your job ends when the files are correct on disk. A Committer agent runs "
+            f"immediately after you and handles `git add`, `git commit`, and `git push`. "
+            f"If you commit or push, you will create duplicate commits and break the pipeline."
         )
         result = runner.run(
             system_prompt=system_prompt,
@@ -932,6 +959,12 @@ Keep the reason brief (one sentence)."""
 
         ctx_path = self._context_log_path(session)
 
+        pr_notes = _spec_section(session.work_item.spec_content, _PR_SUBMITTER_HEADINGS)
+        pr_notes_block = (
+            f"\n## Spec notes for this PR\n{pr_notes}\n"
+            if pr_notes else ""
+        )
+
         task = (
             f"Work ID: {session.work_item.work_id}\n"
             f"Attempt: {session.attempt_number}\n\n"
@@ -971,6 +1004,7 @@ Keep the reason brief (one sentence)."""
             f"work ID ({session.work_item.work_id}), 'Generated by spec-to-pr'\n\n"
             f"After handling each repo, report the PR URL as:\n"
             f"PR created for <repo-name>: <url>\n\n"
+            f"{pr_notes_block}"
             f"When all repos are handled, respond with 'PR submission complete.'"
         )
 
