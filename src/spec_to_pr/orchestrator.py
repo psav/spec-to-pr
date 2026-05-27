@@ -328,6 +328,21 @@ class Orchestrator:
             self._circuit_breaker.record_attempt(fingerprint, 0.0)
             self.state_machine.transition(session, implementation_complete=False)
 
+    def _find_ready_ephemeral(self, cwd: Path, branch: str) -> str:
+        """Return the ID of a STATE=ready ephemeral env matching branch, or empty string."""
+        envs_file = cwd / ".ephemeral-envs"
+        if not envs_file.exists() or not branch:
+            return ""
+        for line in envs_file.read_text().splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            env_id = parts[0]
+            kvs = dict(p.split("=", 1) for p in parts[1:] if "=" in p)
+            if kvs.get("STATE") == "ready" and kvs.get("BRANCH") == branch:
+                return env_id
+        return ""
+
     def _deploy(self, session: OrchestratorSession) -> None:
         if self.config.skip_deploy:
             log.info("skip_deploy=True — skipping deployment, jumping to PR submission")
@@ -341,22 +356,29 @@ class Orchestrator:
         if make_vars:
             log.info("Using deployment params from developer agent: %s", make_vars)
 
+        branch = (make_vars or {}).get("BRANCH", "")
         envs_file = cwd / ".ephemeral-envs"
         if envs_file.exists():
-            in_progress = [
-                line for line in envs_file.read_text().splitlines()
-                if "STATE=provisioning" in line
-            ]
+            # Reuse an already-ready environment for the same branch
+            ready_id = self._find_ready_ephemeral(cwd, branch)
+            if ready_id:
+                log.info("Reusing existing ephemeral environment %s for branch %s", ready_id, branch)
+                session.ephemeral_id = ready_id
+                self.state_machine.transition(session, deployment_successful=True)
+                return
+            # Guard against double-provisioning
+            in_progress = [l for l in envs_file.read_text().splitlines() if "STATE=provisioning" in l]
             if in_progress:
-                log.warning(
-                    "Skipping ephemeral-provision — %d env(s) already provisioning: %s",
-                    len(in_progress), in_progress,
-                )
+                log.warning("Skipping ephemeral-provision — env(s) already provisioning: %s", in_progress)
                 self.state_machine.transition(session, deployment_successful=True)
                 return
 
         log.info("Running make ephemeral-provision in %s", cwd)
         ok, stderr = self._run_make("ephemeral-provision", cwd=cwd, make_vars=make_vars)
+
+        # Capture the new ephemeral ID from .ephemeral-envs after provisioning
+        if ok and branch:
+            session.ephemeral_id = self._find_ready_ephemeral(cwd, branch)
 
         if not ok:
             error_class = self._classify_deployment_error(stderr)
@@ -385,7 +407,10 @@ class Orchestrator:
     def _run_e2e(self, session: OrchestratorSession) -> None:
         log.info("Running e2e tests")
         cwd = Path(session.repos[0].workspace_path) if session.repos else self.config.workspace
-        ok, _ = self._run_make("ephemeral-e2e", cwd=cwd)
+        e2e_vars = {"ID": session.ephemeral_id} if session.ephemeral_id else None
+        if e2e_vars:
+            log.info("Running make ephemeral-e2e with ID=%s", session.ephemeral_id)
+        ok, _ = self._run_make("ephemeral-e2e", cwd=cwd, make_vars=e2e_vars)
         if not ok:
             self._context_log_append(
                 session,
