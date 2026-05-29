@@ -69,6 +69,10 @@ class StateMachine:
     def _from_circuit_breaker(self, session: OrchestratorSession, breaker_tripped: bool = False, **_) -> None:
         if breaker_tripped:
             session.current_phase = Phase.HUMAN_ESCALATION
+        elif session.skip_implementation:
+            session.skip_implementation = False
+            session.attempt_number += 1
+            session.current_phase = Phase.DEPLOYMENT
         else:
             session.attempt_number += 1
             session.current_phase = Phase.IMPLEMENTATION

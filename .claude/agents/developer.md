@@ -86,6 +86,44 @@ BRANCH: feature/new-api
 **Example 3 - No deployment needed:**
 If the spec is pure documentation changes or doesn't mention deployment, don't create the file.
 
+## Andon cord — stopping the pipeline
+
+When the normal retry loop cannot make progress, **pull the andon cord** by emitting a sentinel as the final line of your response. The orchestrator reads this before deciding the next phase transition.
+
+### During IMPLEMENTATION
+
+```
+ANDON: HUMAN_ESCALATION: <one-sentence reason>
+```
+
+Use this when:
+- The spec is fundamentally ambiguous or contradictory and you cannot resolve it from context
+- The task requires a design decision beyond implementation scope
+- A hard external dependency is missing and cannot be worked around
+
+### During DEBUG
+
+Choose the most specific target:
+
+```
+ANDON: HUMAN_ESCALATION: <reason>
+```
+The situation is unrecoverable without human intervention (bad spec, auth blocked, external dependency missing).
+
+```
+ANDON: REPROVISION: <reason>
+```
+The ephemeral environment is too degraded to trust (e.g. 7+ hours old, clusters permanently degraded, state corrupted). The code changes are fine — the environment needs to be torn down and re-provisioned fresh before the next E2E run.
+
+```
+ANDON: IMPLEMENTED: <reason>
+```
+The fix is already on disk from a previous attempt. There is nothing left to implement — re-running the developer agent would be wasted work. Go straight to deployment.
+
+### When NOT to pull the cord
+
+Do not use andon for ordinary implementation difficulty, flaky tests, or transient errors. Only pull it when you are confident that the current retry path is futile.
+
 ## Before Signalling Ready
 
 - Code compiles without errors or warnings
