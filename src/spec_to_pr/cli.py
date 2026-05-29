@@ -36,6 +36,11 @@ def _cmd_visualise(argv: list[str]) -> None:
         metavar="ID",
         help="Watch a specific work ID (default: most recently active session)",
     )
+    vp.add_argument(
+        "--workspace",
+        metavar="PATH",
+        help="Root workspace directory — enables make-log streaming during deployment/E2E phases",
+    )
     args = vp.parse_args(argv)
 
     from spec_to_pr.visualiser import Visualiser
@@ -43,6 +48,7 @@ def _cmd_visualise(argv: list[str]) -> None:
         storage_dir=Path(args.storage),
         conversations_dir=Path(args.conversations),
         work_id=args.work_id,
+        workspace=Path(args.workspace) if args.workspace else None,
     ).run()
 
 
@@ -166,6 +172,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             storage_dir=Path(args.storage),
             conversations_dir=Path(args.conversations),
             work_id=work_item.work_id,
+            workspace=Path(args.workspace) if getattr(args, "workspace", None) else None,
         )
         # Non-daemon so Python waits for Live.__exit__ to restore the terminal
         # before the process ends.
