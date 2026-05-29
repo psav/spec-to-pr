@@ -58,6 +58,7 @@ PHASE_LABELS = {
 MAX_LOG_BUFFER = 200
 DISPLAY_LOG_LINES = 35
 POLL_INTERVAL = 0.5
+CONV_FRESHNESS_SECS = 30
 
 
 class Visualiser:
@@ -66,10 +67,12 @@ class Visualiser:
         storage_dir: Path,
         conversations_dir: Path,
         work_id: Optional[str] = None,
+        workspace: Optional[Path] = None,
     ) -> None:
         self.storage_dir = storage_dir
         self.conversations_dir = conversations_dir
         self.work_id = work_id
+        self.workspace = workspace
 
         self._session: dict = {}
         self._session_mtime: float = 0.0
@@ -77,6 +80,8 @@ class Visualiser:
         self._log_lines: list[Text] = []
         self._conv_file: Optional[Path] = None
         self._conv_pos: int = 0
+        self._make_log_file: Optional[Path] = None
+        self._make_log_pos: int = 0
 
     def run(self, stop_event: "threading.Event | None" = None) -> None:
         if not HAS_RICH:
@@ -147,8 +152,39 @@ class Visualiser:
             return None
         return max(candidates, key=lambda p: p.stat().st_mtime)
 
+    def _find_latest_make_log(self) -> Optional[Path]:
+        if not self.workspace or not self.work_id:
+            return None
+        candidates = list(self.workspace.glob(f"*/.spec-to-pr/make-logs/{self.work_id}-*.log"))
+        if not candidates:
+            return None
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+
     def _poll_log(self) -> None:
-        latest = self._find_latest_conv()
+        latest_conv = self._find_latest_conv()
+        latest_make = self._find_latest_make_log()
+        now = time.time()
+
+        conv_is_fresh = (
+            latest_conv is not None
+            and now - latest_conv.stat().st_mtime < CONV_FRESHNESS_SECS
+        )
+        use_make_log = not conv_is_fresh and latest_make is not None
+
+        if use_make_log:
+            self._poll_make_log_source(latest_make)
+        else:
+            self._poll_conv_source(latest_conv)
+
+        if len(self._log_lines) > MAX_LOG_BUFFER:
+            self._log_lines = self._log_lines[-MAX_LOG_BUFFER:]
+
+    def _poll_conv_source(self, latest: Optional[Path]) -> None:
+        if self._make_log_file is not None:
+            self._make_log_file = None
+            sep = Text()
+            sep.append("── agent resumed ──", style="dim italic cyan")
+            self._log_lines.append(sep)
 
         if latest != self._conv_file:
             self._conv_file = latest
@@ -167,9 +203,6 @@ class Visualiser:
                 new_data = f.read()
                 self._conv_pos = f.tell()
 
-            if not new_data:
-                return
-
             for raw in new_data.splitlines():
                 raw = raw.strip()
                 if not raw:
@@ -181,9 +214,39 @@ class Visualiser:
                         self._log_lines.append(line)
                 except json.JSONDecodeError:
                     pass
+        except Exception:
+            pass
 
-            if len(self._log_lines) > MAX_LOG_BUFFER:
-                self._log_lines = self._log_lines[-MAX_LOG_BUFFER:]
+    def _poll_make_log_source(self, latest: Optional[Path]) -> None:
+        if self._conv_file is not None and self._make_log_file is None:
+            sep = Text()
+            sep.append("── make ──", style="dim italic yellow")
+            self._log_lines.append(sep)
+
+        if latest != self._make_log_file:
+            self._make_log_file = latest
+            self._make_log_pos = 0
+            if latest:
+                sep = Text()
+                sep.append(f"── {latest.name} ──", style="dim italic")
+                self._log_lines.append(sep)
+
+        if not self._make_log_file:
+            return
+
+        try:
+            with self._make_log_file.open() as f:
+                f.seek(self._make_log_pos)
+                new_data = f.read()
+                self._make_log_pos = f.tell()
+
+            for line in new_data.splitlines():
+                line = line.rstrip()
+                if not line:
+                    continue
+                t = Text()
+                t.append(escape(line), style="dim")
+                self._log_lines.append(t)
         except Exception:
             pass
 
@@ -391,7 +454,12 @@ class Visualiser:
         return t
 
     def _render_log(self, console: "Console") -> Panel:
-        conv_name = self._conv_file.name if self._conv_file else "none"
+        if self._make_log_file is not None:
+            conv_name = self._make_log_file.name
+        elif self._conv_file is not None:
+            conv_name = self._conv_file.name
+        else:
+            conv_name = "none"
 
         if self._log_lines:
             visible = self._log_lines[-DISPLAY_LOG_LINES:]

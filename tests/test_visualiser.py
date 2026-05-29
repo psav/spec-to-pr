@@ -313,3 +313,99 @@ def test_cli_normal_subcommand_unaffected() -> None:
     )
     assert result.returncode == 0
     assert "--file" in result.stdout
+
+
+def test_cli_visualise_help_includes_workspace() -> None:
+    result = subprocess.run(
+        [_CLI_BINARY, "--visualise", "--help"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "--workspace" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Make-log streaming
+# ---------------------------------------------------------------------------
+
+def _make_log_env(tmp_path: Path, work_id: str = "TEST-1") -> tuple[Visualiser, Path]:
+    """Return a Visualiser with workspace set and a make-log directory ready."""
+    storage = tmp_path / "sessions"
+    convs = tmp_path / "conversations"
+    workspace = tmp_path / "workspace"
+    repo = workspace / "some-repo"
+    log_dir = repo / ".spec-to-pr" / "make-logs"
+    log_dir.mkdir(parents=True)
+    (storage / work_id).mkdir(parents=True)
+    convs.mkdir()
+    (storage / work_id / "session.yaml").write_text(
+        _SESSION_YAML.format(phase="deployment", attempt=0, work_id=work_id)
+    )
+    v = Visualiser(
+        storage_dir=storage,
+        conversations_dir=convs,
+        work_id=work_id,
+        workspace=workspace,
+    )
+    return v, log_dir
+
+
+def test_find_latest_make_log_returns_none_without_workspace(tmp_path: Path) -> None:
+    v = Visualiser(storage_dir=tmp_path, conversations_dir=tmp_path, work_id="TEST-1")
+    assert v._find_latest_make_log() is None
+
+
+def test_find_latest_make_log_returns_none_when_no_logs(tmp_path: Path) -> None:
+    v, log_dir = _make_log_env(tmp_path)
+    assert v._find_latest_make_log() is None
+
+
+def test_find_latest_make_log_finds_matching_log(tmp_path: Path) -> None:
+    v, log_dir = _make_log_env(tmp_path)
+    log_file = log_dir / "TEST-1-ephemeral-provision-20260529-120000.log"
+    log_file.write_text("=== make ephemeral-provision started ===\nsome output\n")
+    result = v._find_latest_make_log()
+    assert result == log_file
+
+
+def test_find_latest_make_log_ignores_other_work_id(tmp_path: Path) -> None:
+    v, log_dir = _make_log_env(tmp_path)
+    (log_dir / "OTHER-1-ephemeral-provision-20260529-120000.log").write_text("noise")
+    assert v._find_latest_make_log() is None
+
+
+def test_find_latest_make_log_returns_most_recent(tmp_path: Path) -> None:
+    v, log_dir = _make_log_env(tmp_path)
+    old = log_dir / "TEST-1-ephemeral-provision-20260529-110000.log"
+    new = log_dir / "TEST-1-ephemeral-e2e-20260529-120000.log"
+    old.write_text("old")
+    time.sleep(0.01)
+    new.write_text("new")
+    assert v._find_latest_make_log() == new
+
+
+def test_poll_log_streams_make_log_when_no_conv(tmp_path: Path) -> None:
+    v, log_dir = _make_log_env(tmp_path)
+    log_file = log_dir / "TEST-1-ephemeral-e2e-20260529-120000.log"
+    log_file.write_text("=== make ephemeral-e2e started ===\nBuilding image...\n")
+    v._poll_log()
+    texts = [t.plain for t in v._log_lines]
+    combined = " ".join(texts)
+    assert "Building image" in combined
+
+
+def test_poll_log_prefers_fresh_conv_over_make_log(tmp_path: Path) -> None:
+    v, log_dir = _make_log_env(tmp_path)
+    log_file = log_dir / "TEST-1-ephemeral-e2e-20260529-120000.log"
+    log_file.write_text("make output\n")
+    # Write a fresh JSONL (just modified)
+    convs = tmp_path / "conversations"
+    conv_file = convs / "TEST-1_fresh.jsonl"
+    entry = {"type": "result", "final_text": "Agent done."}
+    conv_file.write_text(json.dumps(entry) + "\n")
+    v._poll_log()
+    texts = [t.plain for t in v._log_lines]
+    combined = " ".join(texts)
+    assert "Agent done" in combined
+    assert "make output" not in combined

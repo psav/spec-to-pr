@@ -377,7 +377,7 @@ class Orchestrator:
                 return
 
         log.info("Running make ephemeral-provision in %s", cwd)
-        ok, stderr = self._run_make("ephemeral-provision", cwd=cwd, make_vars=make_vars)
+        ok, stderr = self._run_make("ephemeral-provision", cwd=cwd, make_vars=make_vars, work_id=session.work_item.work_id)
 
         # Capture the new ephemeral ID from .ephemeral-envs after provisioning
         if ok and branch:
@@ -413,7 +413,7 @@ class Orchestrator:
         e2e_vars = {"ID": session.ephemeral_id} if session.ephemeral_id else None
         if e2e_vars:
             log.info("Running make ephemeral-e2e with ID=%s", session.ephemeral_id)
-        ok, _ = self._run_make("ephemeral-e2e", cwd=cwd, make_vars=e2e_vars)
+        ok, _ = self._run_make("ephemeral-e2e", cwd=cwd, make_vars=e2e_vars, work_id=session.work_item.work_id)
         if not ok:
             self._context_log_append(
                 session,
@@ -811,7 +811,7 @@ Keep the reason brief (one sentence)."""
 
         return "unknown"
 
-    def _run_make(self, target: str, cwd: Path | None = None, make_vars: dict[str, str] | None = None) -> tuple[bool, str]:
+    def _run_make(self, target: str, cwd: Path | None = None, make_vars: dict[str, str] | None = None, work_id: str | None = None) -> tuple[bool, str]:
         """Run make target with optional variables. Returns (success, stderr)."""
         run_cwd = cwd or self.config.workspace
         # Ensure SSL/cert environment variables are passed through for proxy environments
@@ -842,11 +842,14 @@ Keep the reason brief (one sentence)."""
         log_dir = run_cwd / ".spec-to-pr" / "make-logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        log_path = log_dir / f"{target}-{timestamp}.log"
+        prefix = f"{work_id}-" if work_id else ""
+        log_path = log_dir / f"{prefix}{target}-{timestamp}.log"
         log.info("make %s → streaming output to %s", target, log_path)
 
         stderr_buf: list[str] = []
         with open(log_path, "w") as lf:
+            lf.write(f"=== make {target} started at {timestamp} ===\n")
+            lf.flush()
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, cwd=run_cwd, env=env,
@@ -867,6 +870,8 @@ Keep the reason brief (one sentence)."""
             proc.wait()
             t_out.join()
             t_err.join()
+            status = "completed" if proc.returncode == 0 else f"FAILED (exit {proc.returncode})"
+            lf.write(f"=== make {target} {status} ===\n")
 
         stderr = "".join(stderr_buf)
         if proc.returncode != 0:
