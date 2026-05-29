@@ -855,13 +855,20 @@ Keep the reason brief (one sentence)."""
                 text=True, cwd=run_cwd, env=env,
             )
 
+            # When the TUI visualiser is active stdout is redirected to /dev/null.
+            # Writing make output to the terminal races with Rich redraws and causes
+            # flickering — suppress tty output and let the visualiser stream the log file.
+            silent = sys.stdout is not sys.__stdout__
+
             def _drain(stream, collect: list[str] | None, tty) -> None:
                 for line in stream:
                     lf.write(line)
+                    lf.flush()
                     if collect is not None:
                         collect.append(line)
-                    tty.write(line)
-                    tty.flush()
+                    if not silent:
+                        tty.write(line)
+                        tty.flush()
 
             t_out = threading.Thread(target=_drain, args=(proc.stdout, None, sys.stdout), daemon=True)
             t_err = threading.Thread(target=_drain, args=(proc.stderr, stderr_buf, sys.stderr), daemon=True)
