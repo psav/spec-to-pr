@@ -10,6 +10,21 @@ from .work_item import WorkItem
 
 _TERMINAL_PHASES = {"complete", "human_escalation", "aborted"}
 
+ANDON_TARGETS = {"HUMAN_ESCALATION", "REPROVISION", "IMPLEMENTED"}
+
+
+@dataclass
+class AndonSignal:
+    """Structured escalation signal any agent can emit to break the retry loop."""
+    # target is one of ANDON_TARGETS:
+    #   HUMAN_ESCALATION — stop; a human must decide
+    #   REPROVISION      — skip implementation, tear down and re-provision the env
+    #   IMPLEMENTED      — fix is already on disk; skip implementation, go straight to deployment
+    target: str
+    reason: str
+    agent: str
+    timestamp: str = ""
+
 
 class Phase(str, Enum):
     SPEC_INGESTION = "spec_ingestion"
@@ -50,6 +65,8 @@ class OrchestratorSession:
     updated_at: datetime
     deployment_params: dict[str, str] = field(default_factory=dict)
     ephemeral_id: str = ""
+    pending_andon: Optional[AndonSignal] = None
+    skip_implementation: bool = False
 
     @classmethod
     def new(cls, work_item: WorkItem, dry_run: bool = False, max_attempts: int = 3) -> OrchestratorSession:

@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Optional
 
 from spec_to_pr.models import (
+    AndonSignal,
+    ANDON_TARGETS,
     CircuitBreaker,
     DebugMemoryEntry,
     E2EResults,
@@ -297,7 +299,8 @@ class Orchestrator:
         """Spawn Claude SDK agent sessions for implementation work."""
         log.info("Running implementation team (attempt %d)", session.attempt_number)
         try:
-            self._run_claude_agent("developer", session)
+            if self._run_claude_agent("developer", session):
+                return  # andon signal handled; session.current_phase already updated
 
             # Load deployment parameters if developer agent provided them
             self._load_deployment_params(session)
@@ -423,8 +426,9 @@ class Orchestrator:
     def _debug(self, session: OrchestratorSession) -> None:
         log.info("Entering debug phase for attempt %d", session.attempt_number)
         previous = self.storage.load_debug_entries(session.work_item.work_id)
+        andon_signal: Optional[AndonSignal] = None
         try:
-            findings = self._run_claude_agent_debug("developer", session, previous)
+            findings, andon_signal = self._run_claude_agent_debug("developer", session, previous)
         except Exception as exc:
             log.error("Debug agent failed: %s", exc)
             findings = [f"Debug agent error: {exc}"]
@@ -442,6 +446,10 @@ class Orchestrator:
         self.storage.save_debug_entry(session.work_item.work_id, entry)
         assert self._circuit_breaker is not None
         self._circuit_breaker.record_attempt(fingerprint, progress)
+
+        if andon_signal and self._handle_andon(andon_signal, session):
+            return  # HUMAN_ESCALATION — skip circuit breaker, session phase already set
+
         self.state_machine.transition(session)
 
     def _check_circuit_breaker(self, session: OrchestratorSession) -> None:
@@ -894,8 +902,12 @@ Keep the reason brief (one sentence)."""
 
         return runner, system_prompt
 
-    def _run_claude_agent(self, persona_name: str, session: OrchestratorSession) -> None:
-        """Run a Claude SDK agent session for implementation work."""
+    def _run_claude_agent(self, persona_name: str, session: OrchestratorSession) -> bool:
+        """Run a Claude SDK agent session for implementation work.
+
+        Returns True if an andon signal was raised and the caller should return
+        immediately (session.current_phase has already been updated).
+        """
         runner, system_prompt = self._make_runner(persona_name, session)
         ctx_path = self._context_log_path(session)
 
@@ -917,6 +929,13 @@ Keep the reason brief (one sentence)."""
             f"changed (with file paths), and what still needs work. Include the path to "
             f"your conversation log if available. Then respond with a final summary "
             f"followed by exactly: 'Implementation complete.'\n\n"
+            f"## Escalation\n"
+            f"If you determine that no amount of implementation can unblock this work item "
+            f"(e.g. the spec is fundamentally ambiguous, requires a human design decision, "
+            f"or depends on external changes outside your control), emit an andon signal "
+            f"as the last line of your response:\n\n"
+            f"  ANDON: HUMAN_ESCALATION: <one-sentence reason>\n\n"
+            f"The orchestrator will halt the pipeline and surface your reason to the team.\n\n"
             f"## STOP — do not commit or push\n"
             f"Your job ends when the files are correct on disk. A Committer agent runs "
             f"immediately after you and handles `git add`, `git commit`, and `git push`. "
@@ -929,10 +948,19 @@ Keep the reason brief (one sentence)."""
         )
         log.info("Implementation agent finished. Summary: %s", result[:200])
 
+        signal = self._extract_andon_signal(result, agent=persona_name)
+        if signal:
+            return self._handle_andon(signal, session)
+        return False
+
     def _run_claude_agent_debug(
         self, persona_name: str, session: OrchestratorSession, previous: list
-    ) -> list[str]:
-        """Run a debug agent session and return a list of findings."""
+    ) -> tuple[list[str], Optional[AndonSignal]]:
+        """Run a debug agent session.
+
+        Returns (findings, andon_signal). andon_signal is None when the agent
+        wants the normal retry loop to continue.
+        """
         runner, system_prompt = self._make_runner(persona_name, session)
         ctx_path = self._context_log_path(session)
 
@@ -946,6 +974,19 @@ Keep the reason brief (one sentence)."""
             f"and why. Append your findings to `{ctx_path}` as a markdown section, "
             f"including the path to your conversation log. Then return a bullet-point list "
             f"of findings and hypotheses followed by exactly: 'Debug complete.'\n\n"
+            f"## Escalation — andon cord\n"
+            f"If you conclude that the normal retry loop cannot make progress, emit an andon "
+            f"signal as the last line of your response. Choose the most specific target:\n\n"
+            f"  ANDON: HUMAN_ESCALATION: <reason>\n"
+            f"    — no amount of retrying will fix this; a human must decide\n"
+            f"      (e.g. fundamental design issue, ambiguous spec, auth/infra blocked)\n\n"
+            f"  ANDON: REPROVISION: <reason>\n"
+            f"    — the ephemeral environment is too degraded to trust; re-provision fresh\n"
+            f"      before the next E2E run (code is fine, environment is the problem)\n\n"
+            f"  ANDON: IMPLEMENTED: <reason>\n"
+            f"    — the fix is already on disk from a previous attempt; skip re-implementation\n"
+            f"      and go straight to deployment\n\n"
+            f"The orchestrator reads this signal before deciding the next phase transition.\n\n"
             f"## Constraints\n"
             f"- Do NOT run `make ephemeral-provision` — provisioning is the orchestrator's job on retry.\n"
             f"- You MAY run `make ephemeral-resync ID=<id>` if an environment already exists and "
@@ -959,11 +1000,13 @@ Keep the reason brief (one sentence)."""
             task=task,
             work_id=f"{session.work_item.work_id}-debug"
         )
-        return [
+        findings = [
             line.lstrip("-• ").strip()
             for line in response.splitlines()
             if line.strip() and not line.strip().startswith("#")
         ]
+        signal = self._extract_andon_signal(response, agent=f"{persona_name}-debug")
+        return findings, signal
 
     def _run_pr_submission_agent(self, repos: list, session: OrchestratorSession) -> None:
         """Run PR submission agent to push branches and create PRs."""
@@ -1051,6 +1094,37 @@ Keep the reason brief (one sentence)."""
                     repo.pr_url = pr_url.strip()
                     log.info("Recorded PR URL for %s: %s", repo.repo_name, repo.pr_url)
                     break
+
+    def _extract_andon_signal(self, text: str, agent: str) -> Optional[AndonSignal]:
+        """Parse an ANDON sentinel from agent output, e.g. 'ANDON: REPROVISION: reason...'"""
+        pattern = r"^ANDON:\s*(" + "|".join(ANDON_TARGETS) + r"):\s*(.+)$"
+        m = re.search(pattern, text, re.MULTILINE | re.IGNORECASE)
+        if not m:
+            return None
+        return AndonSignal(
+            target=m.group(1).upper(),
+            reason=m.group(2).strip(),
+            agent=agent,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        )
+
+    def _handle_andon(self, signal: AndonSignal, session: OrchestratorSession) -> bool:
+        """Apply an andon signal. Returns True if the caller should return immediately."""
+        log.warning(
+            "ANDON raised by %s: target=%s reason=%s",
+            signal.agent, signal.target, signal.reason,
+        )
+        self._context_log_append(
+            session,
+            f"ANDON: {signal.target} (raised by {signal.agent})",
+            f"{signal.reason}",
+        )
+        if signal.target == "HUMAN_ESCALATION":
+            session.current_phase = Phase.HUMAN_ESCALATION
+            return True
+        # REPROVISION and IMPLEMENTED both skip implementation on the next attempt
+        session.skip_implementation = True
+        return False
 
     def _estimate_progress(self, session: OrchestratorSession) -> float:
         return max(0.0, 1.0 - (session.attempt_number / session.max_attempts))
